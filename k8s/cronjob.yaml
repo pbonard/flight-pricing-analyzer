@@ -34,7 +34,7 @@ spec:
           containers:
             - name: collector
               # the tag is written by .github/workflows/build.yml on every push to main
-              image: ghcr.io/pbonard/flight-pricing-analyzer:latest
+              image: ghcr.io/pbonard/flight-pricing-analyzer:5879335
               env:
                 # city codes: SEL is ICN and GMP, TYO is NRT and HND, OSA is KIX and ITM. a search per city pair
                 # covers all their airports, half the requests of searching each airport pair
