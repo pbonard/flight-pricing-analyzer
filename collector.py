@@ -144,7 +144,7 @@ def local_datetime(d) -> datetime:
 
 
 def search(origin: str, destination: str, depart: date, proxy: str | None):
-    """Returns (status, offers, error): status is ok, not_found, blocked or error, offers the results that passed
+    """Returns (status, flights, error): status is ok, not_found, blocked or error, flights the results that passed
     the checks with Google's rank and their legs' carriers, [(rank, result, [(code, number, name) or None per leg])].
     error says how many results were skipped when some were."""
     query = create_query(
@@ -180,7 +180,7 @@ def search(origin: str, destination: str, depart: date, proxy: str | None):
         log.warning("leg carriers of %d results for %d results, saving without them", len(carriers), len(results))
         carriers = [[] for _ in results]
 
-    offers, skipped, unmatched = [], [], 0
+    flights, skipped, unmatched = [], [], 0
     for rank, (f, legs) in enumerate(zip(results, carriers)):
         problem = result_problem(f, depart)
         if problem:
@@ -190,14 +190,14 @@ def search(origin: str, destination: str, depart: date, proxy: str | None):
         if not carriers_match(f, legs):
             unmatched += len(legs) > 0
             legs = [None] * len(f.flights)
-        offers.append((rank, f, legs))
+        flights.append((rank, f, legs))
 
     if unmatched:
         log.warning("%d results' leg carriers don't match their airlines, saved without them", unmatched)
     if skipped:
         log.warning("skipped %d results: %s", len(skipped), "; ".join(skipped))
-        return "ok", offers, f"skipped {len(skipped)} invalid results: {'; '.join(skipped)}"[:1000]
-    return "ok", offers, None
+        return "ok", flights, f"skipped {len(skipped)} invalid results: {'; '.join(skipped)}"[:1000]
+    return "ok", flights, None
 
 
 def flight_row(search_id, rank: int, f, carriers: list) -> tuple:
@@ -238,22 +238,22 @@ def leg_rows(search_id, rank: int, f, carriers: list) -> list[tuple]:
     ]
 
 
-def save(conn, run_id, fetched_at, origin, destination, depart, status, offers, error) -> None:
+def save(conn, run_id, fetched_at, origin, destination, depart, status, flights, error) -> None:
     with conn.transaction():
         search_id = conn.execute(
             """INSERT INTO search
-                   (run_id, fetched_at, origin, destination, depart_date, currency, status, error, offer_count)
+                   (run_id, fetched_at, origin, destination, depart_date, currency, status, error, flight_count)
                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
-            (run_id, fetched_at, origin, destination, depart, CURRENCY, status, error, len(offers)),
+            (run_id, fetched_at, origin, destination, depart, CURRENCY, status, error, len(flights)),
         ).fetchone()[0]
-        if offers:
+        if flights:
             with conn.cursor() as cur:
                 cur.executemany(
                     """INSERT INTO flight
                            (search_id, rank, from_airport, to_airport, price, stops, depart_at, arrive_at,
                             flying_min, carbon_g, typical_carbon_g, itinerary_key)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                    [flight_row(search_id, rank, f, legs) for rank, f, legs in offers],
+                    [flight_row(search_id, rank, f, legs) for rank, f, legs in flights],
                 )
                 cur.executemany(
                     """INSERT INTO leg
@@ -262,7 +262,7 @@ def save(conn, run_id, fetched_at, origin, destination, depart, status, offers, 
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                     [
                         row
-                        for rank, f, legs in offers
+                        for rank, f, legs in flights
                         for row in leg_rows(search_id, rank, f, legs)
                     ],
                 )
@@ -308,17 +308,17 @@ def main() -> int:
             time.sleep(random.uniform(delay_min, delay_max))
 
         fetched_at = datetime.now(timezone.utc)
-        status, offers, error = search(origin, destination, depart, proxy)
+        status, flights, error = search(origin, destination, depart, proxy)
         counts[status] = counts.get(status, 0) + 1
-        prices = [f.price for _, f, _ in offers if f.price is not None]
+        prices = [f.price for _, f, _ in flights if f.price is not None]
         log.info(
-            "%s->%s %s: %s, %d offers, cheapest %s %s",
-            origin, destination, depart, status, len(offers), min(prices) if prices else "-", error or "",
+            "%s->%s %s: %s, %d flights, cheapest %s %s",
+            origin, destination, depart, status, len(flights), min(prices) if prices else "-", error or "",
         )
 
         # a new connection per save: the pauses are longer than an idle connection should be trusted to live
         with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
-            save(conn, run_id, fetched_at, origin, destination, depart, status, offers, error)
+            save(conn, run_id, fetched_at, origin, destination, depart, status, flights, error)
 
         failures_in_row = failures_in_row + 1 if status in ("blocked", "error") else 0
         if failures_in_row >= max_blocked:

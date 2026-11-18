@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS search
     -- 'ok', 'not_found', 'blocked' or 'error'
     status      VARCHAR(16) NOT NULL,
     error       TEXT        NULL,
-    offer_count INT         NOT NULL,
+    flight_count INT         NOT NULL,
     PRIMARY KEY (id)
 );
 
