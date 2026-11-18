@@ -1,0 +1,80 @@
+# every 2 hours KST the collector searches Seoul -> Tokyo and Seoul -> Osaka and writes to the cloudnative-pg cluster of
+# my-infra k8s/bootstrap/postgres-cluster.yaml.
+# the jitter is in the collector (a random start within 20 minutes, random pauses between searches),
+# the schedule stays on the hour so it's easy to read
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: flight-collector
+  namespace: backend
+spec:
+  schedule: "0 */2 * * *"
+  timeZone: Asia/Seoul
+  # a slow run is skipped over rather than run alongside, two runs at once is twice the traffic to Google
+  concurrencyPolicy: Forbid
+  # a run that couldn't start in time (node down) is skipped, the next one is at most 2 hours away
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # no retries: a failed run is mostly a block, and retrying at once only makes it last
+      backoffLimit: 0
+      # well under the 2 hours, so a hung run never runs into the next
+      activeDeadlineSeconds: 6000
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app: flight-collector
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: ghcr
+          containers:
+            - name: collector
+              # the tag is written by .github/workflows/build.yml on every push to main
+              image: ghcr.io/pbonard/flight-pricing-analyzer:latest
+              env:
+                # city codes: SEL is ICN and GMP, TYO is NRT and HND, OSA is KIX and ITM. a search per city pair
+                # covers all their airports, half the requests of searching each airport pair
+                - name: ORIGINS
+                  value: "SEL"
+                - name: DESTINATIONS
+                  value: "TYO,OSA"
+                # dates followed until they pass
+                - name: DEPART_DATES
+                  value: "2026-12-20"
+                # dates that move with today, for how far ahead is cheapest. each date is 2 more searches a run
+                - name: DAYS_AHEAD
+                  value: "7,14,30,60"
+                - name: START_JITTER_MAX_SECONDS
+                  value: "1200"
+                - name: REQUEST_DELAY_MIN_SECONDS
+                  value: "20"
+                - name: REQUEST_DELAY_MAX_SECONDS
+                  value: "90"
+                - name: MAX_CONSECUTIVE_FAILURES
+                  value: "3"
+                # made by cloudnative-pg for the cluster's owner: postgresql://flights:...@postgres-rw.backend:5432/flights
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres-app
+                      key: uri
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  memory: 256Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                runAsNonRoot: true
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir: {}

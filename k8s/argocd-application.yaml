@@ -1,0 +1,27 @@
+# applied by hand once: kubectl apply -f k8s/argocd-application.yaml. after that argo cd keeps k8s/ in sync with main
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: flight-pricing-analyzer
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/pbonard/flight-pricing-analyzer.git
+    targetRevision: main
+    path: k8s
+    directory:
+      exclude: argocd-application.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: backend
+  syncPolicy:
+    automated:
+      selfHeal: false
+      prune: false
+    retry:
+      limit: 3
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m
