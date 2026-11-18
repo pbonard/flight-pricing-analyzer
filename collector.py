@@ -11,9 +11,11 @@ Writes to the CloudNativePG cluster of DATABASE_URL, creating the tables of sche
 """
 
 import hashlib
+import json
 import logging
 import os
 import random
+import re
 import sys
 import time
 import uuid
@@ -23,7 +25,7 @@ from zoneinfo import ZoneInfo
 import psycopg
 from fast_flights import FlightQuery, FlightsNotFound, Passengers, create_query, fetch_flights_html
 from fast_flights.parser import parse
-from psycopg.types.json import Jsonb
+from selectolax.lexbor import LexborHTMLParser
 
 log = logging.getLogger("collector")
 
@@ -32,6 +34,11 @@ CURRENCY = "KRW"
 
 # what Google answers instead of results when it takes the traffic for a bot
 BLOCK_MARKERS = ("unusual traffic", "/sorry/", "captcha", "detected unusual")
+
+# what a value read from Google has to look like before it's saved, anything else is a misread
+AIRPORT = re.compile(r"[A-Z]{3}")
+AIRLINE_CODE = re.compile(r"[A-Z0-9]{2,3}")
+FLIGHT_NUMBER = re.compile(r"[0-9]{1,4}[A-Z]?")
 
 
 def env_list(name: str, default: str) -> list[str]:
@@ -51,9 +58,78 @@ def departure_dates(today: date) -> list[date]:
     return sorted(d for d in dates if d >= today)
 
 
-def itinerary_key(f) -> str:
-    """The same flights from one search to the next. Google gives no flight numbers, the airlines and each leg's
-    airports and departure time stand in for them."""
+def leg_carriers(html: str) -> list[list[tuple[str, str, str] | None]]:
+    """Each result's legs as (airline code, flight number, airline name), in the order parse() returns the results.
+    fast-flights leaves them out, Google has them at [22] of each raw leg: ['KE', '1105', None, 'Korean Air'].
+    A leg Google gives none for is None, and a page that isn't as expected gives [], it never fails the search."""
+    try:
+        script = LexborHTMLParser(html).css_first(r"script.ds\:1").text()
+        payload = json.loads(script.split("data:", 1)[1].rsplit(",", 1)[0])
+        results = []
+        # the same list parse() reads, so the n-th entry here is the n-th result there
+        for k in payload[3][0] or []:
+            legs = []
+            for raw in k[0][2]:
+                try:
+                    code, number, _, name = raw[22][:4]
+                except (IndexError, TypeError, ValueError):
+                    legs.append(None)
+                    continue
+                legs.append((code, number, name) if valid_carrier(code, number, name) else None)
+            results.append(legs)
+        return results
+    except Exception:
+        return []
+
+
+def valid_carrier(code, number, name) -> bool:
+    return (
+        isinstance(code, str) and AIRLINE_CODE.fullmatch(code) is not None
+        and isinstance(number, str) and FLIGHT_NUMBER.fullmatch(number) is not None
+        and isinstance(name, str) and name.strip() != ""
+    )
+
+
+def carriers_match(f, carriers: list) -> bool:
+    """The legs' airline names, each once in order, are fast-flights' airlines of the result: two readings of different
+    places of Google's data agree, so [22] was read where it should be."""
+    if len(carriers) != len(f.flights) or not all(carriers):
+        return False
+    return list(dict.fromkeys(name for _, _, name in carriers)) == list(f.airlines)
+
+
+def result_problem(f, depart: date) -> str | None:
+    """Why a parsed result can't be saved as it is, None when it can. The columns it fills are checked
+    so a misread never lands in the table, a result failing one is skipped."""
+    if not f.flights:
+        return "no legs"
+    if f.price is not None and not (isinstance(f.price, int) and f.price > 0):
+        return f"price {f.price!r}"
+    for leg in f.flights:
+        for code in (leg.from_airport.code, leg.to_airport.code):
+            if not (isinstance(code, str) and AIRPORT.fullmatch(code)):
+                return f"airport {code!r}"
+        if not (isinstance(leg.duration, int) and leg.duration > 0):
+            return f"duration {leg.duration!r}"
+        try:
+            local_datetime(leg.departure), local_datetime(leg.arrival)
+        except (TypeError, ValueError) as e:
+            return f"time {e}"
+    # Google lists flights leaving on the searched day, another day means the dates were read from the wrong place
+    if date(*f.flights[0].departure.date) != depart:
+        return f"departs {date(*f.flights[0].departure.date)}, searched {depart}"
+    return None
+
+
+def carbon(value) -> int | None:
+    return value if isinstance(value, int) and value >= 0 else None
+
+
+def itinerary_key(f, carriers: list) -> str:
+    """The same flights from one search to the next, with the search's departure date: the flight numbers, KE1105 or
+    KE2102+JL308. When a leg has no number, a hash of the airlines and each leg's airports and departure stands in."""
+    if all(carriers):
+        return "+".join(f"{code}{number}" for code, number, _ in carriers)
     legs = "|".join(
         f"{leg.from_airport.code}{leg.to_airport.code}{date(*leg.departure.date).isoformat()}"
         f"T{leg.departure.time[0]:02d}{leg.departure.time[1]:02d}"
@@ -68,7 +144,9 @@ def local_datetime(d) -> datetime:
 
 
 def search(origin: str, destination: str, depart: date, proxy: str | None):
-    """Returns (status, offers, error): status is ok, not_found, blocked or error."""
+    """Returns (status, offers, error): status is ok, not_found, blocked or error, offers the results that passed
+    the checks with Google's rank and their legs' carriers, [(rank, result, [(code, number, name) or None per leg])].
+    error says how many results were skipped when some were."""
     query = create_query(
         flights=[FlightQuery(date=depart.isoformat(), from_airport=origin, to_airport=destination)],
         seat="economy",
@@ -91,48 +169,79 @@ def search(origin: str, destination: str, depart: date, proxy: str | None):
         return "error", [], f"no results script in a {len(html)} character page"
 
     try:
-        return "ok", list(parse(html)), None
+        results = list(parse(html))
     except FlightsNotFound:
         return "not_found", [], None
     except Exception as e:  # Google changed the page, fast-flights needs an update
         return "error", [], f"parse: {e!r}"[:1000]
 
+    carriers = leg_carriers(html)
+    if len(carriers) != len(results):
+        log.warning("leg carriers of %d results for %d results, saving without them", len(carriers), len(results))
+        carriers = [[] for _ in results]
 
-def offer_row(search_id, rank: int, f) -> tuple:
+    offers, skipped, unmatched = [], [], 0
+    for rank, (f, legs) in enumerate(zip(results, carriers)):
+        problem = result_problem(f, depart)
+        if problem:
+            skipped.append(f"#{rank} {problem}")
+            continue
+        # carriers that don't agree with fast-flights' airlines are left out rather than saved wrong
+        if not carriers_match(f, legs):
+            unmatched += len(legs) > 0
+            legs = [None] * len(f.flights)
+        offers.append((rank, f, legs))
+
+    if unmatched:
+        log.warning("%d results' leg carriers don't match their airlines, saved without them", unmatched)
+    if skipped:
+        log.warning("skipped %d results: %s", len(skipped), "; ".join(skipped))
+        return "ok", offers, f"skipped {len(skipped)} invalid results: {'; '.join(skipped)}"[:1000]
+    return "ok", offers, None
+
+
+def flight_row(search_id, rank: int, f, carriers: list) -> tuple:
     first, last = f.flights[0], f.flights[-1]
-    legs = [
-        {
-            "from": leg.from_airport.code,
-            "to": leg.to_airport.code,
-            "depart": local_datetime(leg.departure).isoformat(),
-            "arrive": local_datetime(leg.arrival).isoformat(),
-            "duration_min": leg.duration,
-            "plane": leg.plane_type,
-        }
-        for leg in f.flights
-    ]
     return (
         search_id,
         rank,
         first.from_airport.code,
         last.to_airport.code,
         f.price,
-        f.airlines,
         len(f.flights) - 1,
         local_datetime(first.departure),
         local_datetime(last.arrival),
         sum(leg.duration for leg in f.flights),
-        f.carbon.emission if f.carbon else None,
-        f.carbon.typical_on_route if f.carbon else None,
-        itinerary_key(f),
-        Jsonb(legs),
+        carbon(f.carbon.emission) if f.carbon else None,
+        carbon(f.carbon.typical_on_route) if f.carbon else None,
+        itinerary_key(f, carriers),
     )
+
+
+def leg_rows(search_id, rank: int, f, carriers: list) -> list[tuple]:
+    return [
+        (
+            search_id,
+            rank,
+            seq,
+            leg.from_airport.code,
+            leg.to_airport.code,
+            local_datetime(leg.departure),
+            local_datetime(leg.arrival),
+            leg.duration,
+            leg.plane_type if isinstance(leg.plane_type, str) and leg.plane_type.strip() else None,
+            carrier[0] if carrier else None,
+            carrier[2] if carrier else None,
+            f"{carrier[0]}{carrier[1]}" if carrier else None,
+        )
+        for seq, (leg, carrier) in enumerate(zip(f.flights, carriers))
+    ]
 
 
 def save(conn, run_id, fetched_at, origin, destination, depart, status, offers, error) -> None:
     with conn.transaction():
         search_id = conn.execute(
-            """INSERT INTO flight_search
+            """INSERT INTO search
                    (run_id, fetched_at, origin, destination, depart_date, currency, status, error, offer_count)
                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
             (run_id, fetched_at, origin, destination, depart, CURRENCY, status, error, len(offers)),
@@ -140,11 +249,22 @@ def save(conn, run_id, fetched_at, origin, destination, depart, status, offers, 
         if offers:
             with conn.cursor() as cur:
                 cur.executemany(
-                    """INSERT INTO flight_offer
-                           (search_id, rank, from_airport, to_airport, price, airlines, stops, depart_at, arrive_at,
-                            flying_min, carbon_g, typical_carbon_g, itinerary_key, legs)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                    [offer_row(search_id, rank, f) for rank, f in enumerate(offers)],
+                    """INSERT INTO flight
+                           (search_id, rank, from_airport, to_airport, price, stops, depart_at, arrive_at,
+                            flying_min, carbon_g, typical_carbon_g, itinerary_key)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    [flight_row(search_id, rank, f, legs) for rank, f, legs in offers],
+                )
+                cur.executemany(
+                    """INSERT INTO leg
+                           (search_id, rank, seq, from_airport, to_airport, depart_at, arrive_at, duration_min,
+                            plane_type, airline_code, airline, flight_number)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    [
+                        row
+                        for rank, f, legs in offers
+                        for row in leg_rows(search_id, rank, f, legs)
+                    ],
                 )
 
 
@@ -190,7 +310,7 @@ def main() -> int:
         fetched_at = datetime.now(timezone.utc)
         status, offers, error = search(origin, destination, depart, proxy)
         counts[status] = counts.get(status, 0) + 1
-        prices = [f.price for f in offers if f.price is not None]
+        prices = [f.price for _, f, _ in offers if f.price is not None]
         log.info(
             "%s->%s %s: %s, %d offers, cheapest %s %s",
             origin, destination, depart, status, len(offers), min(prices) if prices else "-", error or "",
