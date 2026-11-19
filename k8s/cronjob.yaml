@@ -1,18 +1,19 @@
-# every 2 hours KST the collector runs the searches of the flight-collector configmap (k8s/configmap.yaml) and writes
-# to the cloudnative-pg cluster of my-infra k8s/bootstrap/postgres-cluster.yaml.
-# the jitter is in the collector (a random start within 20 minutes, random pauses between searches),
-# the schedule stays on the hour so it's easy to read
+# every 4 hours KST the collector opens the searches of the flight-collector configmap (k8s/configmap.yaml) in
+# headless chromium and writes the whole result list to the cloudnative-pg cluster of my-infra
+# k8s/bootstrap/postgres-cluster.yaml.
+# every 4 hours, not 2: a browser search is heavier on Google, and searching too often gets the ip throttled.
+# the jitter is in the collector, the schedule stays on the hour so it's easy to read
 apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: flight-collector
   namespace: backend
 spec:
-  schedule: "0 */2 * * *"
+  schedule: "0 */4 * * *"
   timeZone: Asia/Seoul
   # a slow run is skipped over rather than run alongside, two runs at once is twice the traffic to Google
   concurrencyPolicy: Forbid
-  # a run that couldn't start in time (node down) is skipped, the next one is at most 2 hours away
+  # a run that couldn't start in time (node down) is skipped, the next one is at most 4 hours away
   startingDeadlineSeconds: 600
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
@@ -20,8 +21,8 @@ spec:
     spec:
       # no retries: a failed run is mostly a block, and retrying at once only makes it last
       backoffLimit: 0
-      # well under the 2 hours, so a hung run never runs into the next
-      activeDeadlineSeconds: 6000
+      # well under the 4 hours, so a hung run never runs into the next
+      activeDeadlineSeconds: 10800
       ttlSecondsAfterFinished: 86400
       template:
         metadata:
@@ -34,7 +35,7 @@ spec:
           containers:
             - name: collector
               # the tag is written by .github/workflows/build.yml on every push to main
-              image: ghcr.io/pbonard/flight-pricing-analyzer:3d5321c
+              image: ghcr.io/pbonard/flight-pricing-analyzer:latest
               # what to search, k8s/configmap.yaml
               envFrom:
                 - configMapRef:
@@ -47,18 +48,21 @@ spec:
                       name: postgres-app
                       key: uri
               resources:
+                # chromium takes a few hundred MB while a page is open
                 requests:
-                  cpu: 50m
-                  memory: 128Mi
+                  cpu: 200m
+                  memory: 512Mi
                 limits:
-                  memory: 256Mi
+                  memory: 1Gi
               securityContext:
                 allowPrivilegeEscalation: false
                 readOnlyRootFilesystem: true
                 runAsNonRoot: true
               volumeMounts:
+                # chromium's profile, cache and shared memory (--disable-dev-shm-usage) are in /tmp
                 - name: tmp
                   mountPath: /tmp
           volumes:
             - name: tmp
-              emptyDir: {}
+              emptyDir:
+                sizeLimit: 1Gi

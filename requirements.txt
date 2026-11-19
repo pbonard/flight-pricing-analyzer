@@ -1,5 +1,0 @@
-fast-flights==3.1.0
-primp==2.0.1
-protobuf==7.36.2
-selectolax==1.0.2
-psycopg[binary]==3.3.9

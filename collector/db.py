@@ -1,15 +1,16 @@
-"""Everything that touches Postgres: the connection, the schema, and saving a search with its flights and legs.
-
-The database is DATABASE_URL, in k8s the CloudNativePG cluster's postgres-app secret. The tables are schema.sql,
-next to this file: applied at the start of every run, it only adds what isn't there.
+"""Saving to Postgres: the tables of schema.sql, next to this file, applied at the start of every run (it only adds
+what isn't there).
 """
 
 import os
+from pathlib import Path
 
 import psycopg
 
 from .config import Config
-from .search import carbon, itinerary_key, local_datetime
+from .parse import Flight
+
+SCHEMA = Path(__file__).resolve().parent / "schema.sql"
 
 
 def connect() -> psycopg.Connection:
@@ -18,51 +19,29 @@ def connect() -> psycopg.Connection:
 
 
 def ensure_schema(conn) -> None:
-    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")) as f:
-        conn.execute(f.read())
+    conn.execute(SCHEMA.read_text())
 
 
-def flight_row(search_id, rank: int, f, carriers: list) -> tuple:
-    first, last = f.flights[0], f.flights[-1]
+def flight_row(search_id, f: Flight) -> tuple:
+    first, last = f.legs[0], f.legs[-1]
     return (
-        search_id,
-        rank,
-        first.from_airport.code,
-        last.to_airport.code,
-        f.price,
-        len(f.flights) - 1,
-        local_datetime(first.departure),
-        local_datetime(last.arrival),
-        sum(leg.duration for leg in f.flights),
-        carbon(f.carbon.emission) if f.carbon else None,
-        carbon(f.carbon.typical_on_route) if f.carbon else None,
-        itinerary_key(f, carriers),
+        search_id, f.rank, first.from_airport, last.to_airport, f.price, f.stops, first.depart_at, last.arrive_at,
+        f.flying_min, f.carbon_g, f.typical_carbon_g, f.itinerary_key,
     )
 
 
-def leg_rows(search_id, rank: int, f, carriers: list) -> list[tuple]:
+def leg_rows(search_id, f: Flight) -> list[tuple]:
     return [
         (
-            search_id,
-            rank,
-            seq,
-            leg.from_airport.code,
-            leg.to_airport.code,
-            local_datetime(leg.departure),
-            local_datetime(leg.arrival),
-            leg.duration,
-            leg.plane_type if isinstance(leg.plane_type, str) and leg.plane_type.strip() else None,
-            carrier[0] if carrier else None,
-            carrier[2] if carrier else None,
-            f"{carrier[0]}{carrier[1]}" if carrier else None,
+            search_id, f.rank, seq, leg.from_airport, leg.to_airport, leg.depart_at, leg.arrive_at, leg.duration_min,
+            leg.plane_type, leg.airline_code, leg.airline, leg.flight_number,
         )
-        for seq, (leg, carrier) in enumerate(zip(f.flights, carriers))
+        for seq, leg in enumerate(f.legs)
     ]
 
 
-def save(
-    conn, config: Config, run_id, fetched_at, origin, destination, depart, return_date, status, flights, error
-) -> None:
+def save(conn, config: Config, run_id, fetched_at, origin, destination, depart, return_date, status,
+         flights: list[Flight], error) -> None:
     with conn.transaction():
         search_id = conn.execute(
             """INSERT INTO search
@@ -81,16 +60,12 @@ def save(
                            (search_id, rank, from_airport, to_airport, price, stops, depart_at, arrive_at,
                             flying_min, carbon_g, typical_carbon_g, itinerary_key)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                    [flight_row(search_id, rank, f, legs) for rank, f, legs in flights],
+                    [flight_row(search_id, f) for f in flights],
                 )
                 cur.executemany(
                     """INSERT INTO leg
                            (search_id, rank, seq, from_airport, to_airport, depart_at, arrive_at, duration_min,
                             plane_type, airline_code, airline, flight_number)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                    [
-                        row
-                        for rank, f, legs in flights
-                        for row in leg_rows(search_id, rank, f, legs)
-                    ],
+                    [row for f in flights for row in leg_rows(search_id, f)],
                 )
