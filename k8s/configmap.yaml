@@ -9,9 +9,11 @@ data:
   # origin-destination pairs, city codes cover all their airports (SEL is ICN and GMP, TYO is NRT and HND)
   ROUTES: "SEL-TYO,SEL-OSA"
   # what to search is each base date plus each of DAYS_AHEAD (0 is the base itself, empty is 0).
-  # the base dates are DEPART_DATES (YYYY-MM-DD,...), or the day of each run (KST) when it's empty
-  DEPART_DATES: ""
-  DAYS_AHEAD: "1,7"
+  # the base dates are DEPART_DATES (YYYY-MM-DD,...), or the day of each run (KST) when it's empty.
+  # fixed dates are followed every run until they leave, for how one flight's price moves up to departure:
+  # a friday and a tuesday each week, weekend against weekday. add the next week's as these pass
+  DEPART_DATES: "2026-11-27,2026-12-01,2026-12-04,2026-12-08,2026-12-11,2026-12-15"
+  DAYS_AHEAD: ""
   # round-trip or one-way, and for a round trip the nights between departure and return
   TRIP: "round-trip"
   STAY_NIGHTS: "3"
