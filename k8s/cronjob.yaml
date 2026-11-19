@@ -38,7 +38,7 @@ spec:
               #   ghcr.io/pbonard/fast-flight-collector  fast-flights, a plain request per search
               #   ghcr.io/pbonard/playwright-collector   a browser, the whole result list
               # change the name to switch, the tag is written by the build on every push to main
-              image: ghcr.io/pbonard/playwright-collector:9dbdc9a
+              image: ghcr.io/pbonard/playwright-collector:e6c73b5
               # what to search, k8s/configmap.yaml
               envFrom:
                 - configMapRef:
