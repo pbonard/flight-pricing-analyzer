@@ -11,68 +11,15 @@ a payload laid out like the page's ds:1 script:
     leg             [3] / [6] from / to, [8] / [10] departure / arrival time, [20] / [21] their dates,
                     [11] minutes in the air, [17] plane, [22] carrier: [code, number, None, name]
 
-Every value is checked before it's handed on: a result whose flight data is wrong is skipped with the reason,
-a leg's carrier that doesn't look right is left out (null), so a misread never lands in a table.
+Every value is checked before it's handed on as a Flight (collector/common/model.py): a result whose flight data is wrong is
+skipped with the reason, a leg's carrier that doesn't look right is left out (null), so a misread never lands in a
+table.
 """
 
-import hashlib
 import json
-import re
-from dataclasses import dataclass
 from datetime import date, datetime
 
-AIRPORT = re.compile(r"[A-Z]{3}")
-AIRLINE_CODE = re.compile(r"[A-Z0-9]{2,3}")
-FLIGHT_NUMBER = re.compile(r"[0-9]{1,4}[A-Z]?")
-
-
-@dataclass(frozen=True)
-class Leg:
-    from_airport: str
-    to_airport: str
-    # local time of each airport, as Google shows it
-    depart_at: datetime
-    arrive_at: datetime
-    duration_min: int
-    plane_type: str | None
-    # all three or none: a carrier that doesn't check out is left out whole
-    airline_code: str | None
-    airline: str | None
-    flight_number: str | None
-
-
-@dataclass(frozen=True)
-class Flight:
-    # position on Google's page, top flights first, 0 is the first
-    rank: int
-    # one of the top flights Google shows first
-    top: bool
-    price: int | None
-    airlines: list[str]
-    legs: list[Leg]
-    carbon_g: int | None
-    typical_carbon_g: int | None
-
-    @property
-    def stops(self) -> int:
-        return len(self.legs) - 1
-
-    @property
-    def flying_min(self) -> int:
-        return sum(leg.duration_min for leg in self.legs)
-
-    @property
-    def itinerary_key(self) -> str:
-        """The same flights from one search to the next, with the search's departure date: the flight numbers,
-        KE1105 or KE2102+JL308. When a leg has no number, a hash of the airlines and each leg's airports and
-        departure stands in, the same as the first collector's."""
-        if all(leg.flight_number for leg in self.legs):
-            return "+".join(leg.flight_number for leg in self.legs)
-        legs = "|".join(
-            f"{leg.from_airport}{leg.to_airport}{leg.depart_at.date().isoformat()}T{leg.depart_at:%H%M}"
-            for leg in self.legs
-        )
-        return hashlib.sha1(f"{','.join(self.airlines)}#{legs}".encode()).hexdigest()[:16]
+from ..common.model import AIRPORT, Flight, Leg, carrier, carriers_match, grams, text, whole, without_carriers
 
 
 def payloads(body: str) -> list:
@@ -112,50 +59,28 @@ def _datetime(day, time) -> datetime:
     return datetime(*day, *_time(time))
 
 
-def _text(value) -> str | None:
-    return value if isinstance(value, str) and value.strip() else None
-
-
-def _grams(value) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
-
-
-def _carrier(raw) -> tuple[str, str, str] | None:
-    try:
-        code, number, _, name = raw[:4]
-    except (TypeError, ValueError):
-        return None
-    if (
-        isinstance(code, str) and AIRLINE_CODE.fullmatch(code)
-        and isinstance(number, str) and FLIGHT_NUMBER.fullmatch(number)
-        and isinstance(name, str) and name.strip()
-    ):
-        return code, number, name
-    return None
-
-
 def _leg(raw) -> Leg:
     """Raises ValueError with the reason when the leg can't be saved as it is."""
     for code in (raw[3], raw[6]):
         if not (isinstance(code, str) and AIRPORT.fullmatch(code)):
             raise ValueError(f"airport {code!r}")
-    if not (isinstance(raw[11], int) and not isinstance(raw[11], bool) and raw[11] > 0):
+    if not (whole(raw[11]) and raw[11] > 0):
         raise ValueError(f"duration {raw[11]!r}")
     try:
         depart_at, arrive_at = _datetime(raw[20], raw[8]), _datetime(raw[21], raw[10])
     except (TypeError, ValueError) as e:
         raise ValueError(f"time {e}") from None
-    carrier = _carrier(raw[22]) if len(raw) > 22 else None
+    found = carrier(raw[22]) if len(raw) > 22 else None
     return Leg(
         from_airport=raw[3],
         to_airport=raw[6],
         depart_at=depart_at,
         arrive_at=arrive_at,
         duration_min=raw[11],
-        plane_type=_text(raw[17]),
-        airline_code=carrier[0] if carrier else None,
-        airline=carrier[2] if carrier else None,
-        flight_number=f"{carrier[0]}{carrier[1]}" if carrier else None,
+        plane_type=text(raw[17]),
+        airline_code=found[0] if found else None,
+        airline=found[2] if found else None,
+        flight_number=f"{found[0]}{found[1]}" if found else None,
     )
 
 
@@ -176,17 +101,16 @@ def flight(rank: int, top: bool, raw, depart: date) -> Flight:
         price = raw[1][0][1]
     except (IndexError, TypeError):
         price = None
-    if price is not None and not (isinstance(price, int) and not isinstance(price, bool) and price > 0):
+    if price is not None and not (whole(price) and price > 0):
         raise ValueError(f"price {price!r}")
     # Google lists flights leaving on the searched day, another day means the dates were read from the wrong place
     if legs[0].depart_at.date() != depart:
         raise ValueError(f"departs {legs[0].depart_at.date()}, searched {depart}")
 
     airlines = [a for a in airlines if isinstance(a, str)] if isinstance(airlines, list) else []
-    # the legs' airline names, each once in order, are Google's airlines of the result: two places of Google's data
-    # agree, so the carriers were read where they should be. otherwise none of them is kept
-    if list(dict.fromkeys(leg.airline for leg in legs)) != airlines:
-        legs = [Leg(**{**leg.__dict__, "airline_code": None, "airline": None, "flight_number": None}) for leg in legs]
+    # carriers that don't agree with Google's airlines of the result are left out rather than saved wrong
+    if not carriers_match(legs, airlines):
+        legs = without_carriers(legs)
 
     extras = itinerary[22] if len(itinerary) > 22 and isinstance(itinerary[22], list) else []
     return Flight(
@@ -195,8 +119,8 @@ def flight(rank: int, top: bool, raw, depart: date) -> Flight:
         price=price,
         airlines=airlines,
         legs=legs,
-        carbon_g=_grams(extras[7]) if len(extras) > 7 else None,
-        typical_carbon_g=_grams(extras[8]) if len(extras) > 8 else None,
+        carbon_g=grams(extras[7]) if len(extras) > 7 else None,
+        typical_carbon_g=grams(extras[8]) if len(extras) > 8 else None,
     )
 
 
