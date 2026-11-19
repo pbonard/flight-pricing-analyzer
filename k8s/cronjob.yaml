@@ -34,7 +34,7 @@ spec:
           containers:
             - name: collector
               # the tag is written by .github/workflows/build.yml on every push to main
-              image: ghcr.io/pbonard/flight-pricing-analyzer:f36dbfc
+              image: ghcr.io/pbonard/flight-pricing-analyzer:3d5321c
               # what to search, k8s/configmap.yaml
               envFrom:
                 - configMapRef:
