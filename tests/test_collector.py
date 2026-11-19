@@ -1,8 +1,8 @@
-"""Tests of the collector package, run from the repo root: python -m unittest discover -s tests -t .
+"""Tests of the collector, run from the repo root: python -m unittest discover -s tests -t .
 
-Google's page is faked with page(): a ds:1 script laid out the way fast-flights' parser and leg_carriers() read it,
-so nothing here goes to Google. The save test needs a Postgres and runs only when TEST_DATABASE_URL is set, in a
-schema of its own that it drops afterwards.
+Google's answers are faked with answer(): a GetShoppingResults answer laid out the way parse.py reads it, so nothing
+here goes to Google or starts a browser. The save tests need a Postgres and run only when TEST_DATABASE_URL is set,
+in a schema of their own that they drop afterwards.
 """
 
 import json
@@ -12,10 +12,7 @@ import uuid
 from datetime import date, datetime
 from unittest import mock
 
-from collector import config as conf
-from collector import db
-from collector import search as g
-from collector import run as r
+from collector import browser, config, db, main, parse, query
 
 DEPART = date(2026, 12, 20)
 RETURN = date(2026, 12, 23)
@@ -32,112 +29,132 @@ def raw_leg(frm, to, carrier, depart=(8, 45), arrive=(11, 20), day=(2026, 12, 20
 
 
 def raw_result(airlines, legs, price, carbon=(80000, 90000)):
-    flight = [None] * 23
-    flight[0], flight[1], flight[2] = "multi", airlines, legs
-    flight[22] = [None] * 7 + list(carbon)
-    return [flight, [[None, price], "booking-token"]]
+    itinerary = [None] * 23
+    itinerary[0], itinerary[1], itinerary[2] = "multi", airlines, legs
+    itinerary[22] = [None] * 7 + list(carbon)
+    return [itinerary, [[None, price], "booking-token"]]
 
 
-def page(results) -> str:
-    payload = [None] * 8
-    payload[3] = [results]
-    payload[7] = [None, [[], []]]
-    data = json.dumps(payload)
-    return (
-        '<html><script class="ds:1" nonce="x">'
-        f"AF_initDataCallback({{key: 'ds:1', hash: '9', data:{data}, sideChannel: {{}}}});"
-        "</script></html>"
-    )
+def payload(top=(), others=()):
+    out = [None] * 8
+    out[2] = [list(top)]
+    out[3] = [list(others)]
+    return out
 
+
+def answer(*payloads) -> str:
+    """A GetShoppingResults answer holding the payloads."""
+    lines = [")]}'", ""]
+    for p in payloads:
+        line = json.dumps([["wrb.fr", None, json.dumps(p)]])
+        lines += [str(len(line)), line]
+    return "\n".join(lines) + "\n"
+
+
+ERROR_ANSWER = (
+    ")]}'\n\n270\n"
+    '[["wrb.fr",null,null,null,null,[13,null,[["type.googleapis.com/travel.frontend.flights.ErrorResponse",[]]]]]]\n'
+)
 
 NONSTOP = raw_result(["Air Premia"], [raw_leg("ICN", "NRT", ["YP", "731", None, "Air Premia"])], 187400)
 CONNECTION = raw_result(
     ["Korean Air"],
     [
         raw_leg("GMP", "CJU", ["KE", "1041", None, "Korean Air"], (7, 0), (8, 10), duration=70, plane="Airbus A321"),
-        raw_leg("CJU", "NRT", ["KE", "2125", None, "Korean Air"], (9, 30), (12, 0), duration=150),
+        raw_leg("CJU", "NRT", ["KE", "2125", None, "Korean Air"], (9, 30), (12,), duration=150),
     ],
     242400,
 )
-NOT_FOUND_PAGE = (
-    '<html><script class="ds:1">AF_initDataCallback({key: \'ds:1\', data:null, errorHasStatus: true, '
-    "sideChannel: {}});</script></html>"
-)
+TOP = raw_result(["ZIPAIR Tokyo"], [raw_leg("ICN", "NRT", ["ZG", "46", None, "ZIPAIR Tokyo"], (13, 5), (15, 30))], 433489)
 
 
-def config(**env) -> conf.Config:
-    return conf.load_config({"START_JITTER_MAX_SECONDS": "0", **env})
+def flights_of(p, depart=DEPART):
+    return parse.flights(p, depart)
 
 
-def run_search(html, cfg=None, depart=DEPART, return_date=None):
-    with mock.patch.object(g, "fetch_flights_html", return_value=html) as fetch:
-        result = g.search(cfg or config(TRIP="one-way"), "SEL", "TYO", depart, return_date)
-    return result, fetch.call_args.args[0]
+class QueryTest(unittest.TestCase):
+    # what fast-flights 3.1.0 encoded for the same searches, recorded before it was removed
+    FAST_FLIGHTS = [
+        ("round-trip", "economy", 1, None, "SEL", "TYO", "2026-12-20", "2026-12-23",
+         "GhoSCjIwMjYtMTItMjBqBRIDU0VMcgUSA1RZTxoaEgoyMDI2LTEyLTIzagUSA1RZT3IFEgNTRUxCAQFIAYgBAZgBAQ=="),
+        ("one-way", "business", 2, 0, "ICN", "BER", "2026-12-19", None,
+         "GhwSCjIwMjYtMTItMTkoAGoFEgNJQ05yBRIDQkVSQgIBAUgDiAEBmAEC"),
+        ("round-trip", "premium-economy", 9, 1, "GMP", "CJU", "2027-01-05", "2027-01-07",
+         "GhwSCjIwMjctMDEtMDUoAWoFEgNHTVByBRIDQ0pVGhwSCjIwMjctMDEtMDcoAWoFEgNDSlVyBRIDR01QQgkBAQEBAQEBAQFIAogBAZgBAQ=="),
+    ]
+
+    def test_the_same_bytes_as_fast_flights(self):
+        for trip, seat, adults, stops, origin, destination, out, back, expected in self.FAST_FLIGHTS:
+            legs = [query.Leg(date.fromisoformat(out), origin, destination)]
+            if back:
+                legs.append(query.Leg(date.fromisoformat(back), destination, origin))
+            with self.subTest(trip=trip, seat=seat, adults=adults, stops=stops):
+                self.assertEqual(query.tfs(legs, trip, seat, adults, stops), expected)
+
+    def test_the_url_escapes_the_search(self):
+        url = query.search_url([query.Leg(DEPART, "SEL", "TYO"), query.Leg(RETURN, "TYO", "SEL")],
+                               "round-trip", "economy", 1, None, "KRW", "en-US")
+        self.assertTrue(url.startswith("https://www.google.com/travel/flights/search?tfs="))
+        self.assertTrue(url.endswith("%3D%3D&hl=en-US&curr=KRW"))
 
 
 class LoadConfigTest(unittest.TestCase):
     def test_defaults(self):
-        cfg = conf.load_config({})
+        cfg = config.load_config({})
         self.assertEqual(cfg.routes, [("SEL", "TYO"), ("SEL", "OSA")])
-        self.assertEqual(cfg.trip, "round-trip")
-        self.assertEqual(cfg.stay_nights, [3])
-        self.assertEqual(cfg.days_ahead, [7, 14, 30, 60])
-        self.assertEqual(cfg.depart_dates, [])
-        self.assertEqual((cfg.seat, cfg.adults, cfg.max_stops, cfg.currency), ("economy", 1, None, "KRW"))
-        self.assertFalse(cfg.dry_run)
+        self.assertEqual((cfg.trip, cfg.stay_nights, cfg.days_ahead, cfg.depart_dates), ("round-trip", [3], [7, 14, 30, 60], []))
+        self.assertEqual((cfg.seat, cfg.adults, cfg.max_stops, cfg.currency, cfg.dry_run), ("economy", 1, None, "KRW", False))
 
     def test_every_setting_is_read(self):
-        cfg = conf.load_config({
+        cfg = config.load_config({
             "ROUTES": "sel-cju, ICN-BKK", "DEPART_DATES": "2026-12-20,2027-01-02", "DAYS_AHEAD": "0,1",
             "TRIP": "round-trip", "STAY_NIGHTS": "4,2,4", "SEAT": "Business", "ADULTS": "2", "MAX_STOPS": "0",
-            "CURRENCY": "usd", "PROXY": "http://proxy:8080", "START_JITTER_MAX_SECONDS": "5",
-            "REQUEST_DELAY_MIN_SECONDS": "1", "REQUEST_DELAY_MAX_SECONDS": "2", "MAX_CONSECUTIVE_FAILURES": "5",
-            "DRY_RUN": "true",
+            "CURRENCY": "usd", "START_JITTER_MAX_SECONDS": "5", "REQUEST_DELAY_MIN_SECONDS": "1",
+            "REQUEST_DELAY_MAX_SECONDS": "2", "MAX_CONSECUTIVE_FAILURES": "5", "DRY_RUN": "true",
         })
         self.assertEqual(cfg.routes, [("SEL", "CJU"), ("ICN", "BKK")])
         self.assertEqual(cfg.depart_dates, [date(2026, 12, 20), date(2027, 1, 2)])
-        self.assertEqual(cfg.days_ahead, [0, 1])
-        self.assertEqual(cfg.stay_nights, [2, 4])
+        self.assertEqual((cfg.days_ahead, cfg.stay_nights), ([0, 1], [2, 4]))
         self.assertEqual((cfg.seat, cfg.adults, cfg.max_stops, cfg.currency), ("business", 2, 0, "USD"))
-        self.assertEqual(cfg.proxy, "http://proxy:8080")
-        self.assertEqual((cfg.start_jitter_max, cfg.delay_min, cfg.delay_max), (5, 1, 2))
-        self.assertEqual(cfg.max_consecutive_failures, 5)
+        self.assertEqual((cfg.start_jitter_max, cfg.delay_min, cfg.delay_max, cfg.max_consecutive_failures), (5, 1, 2, 5))
         self.assertTrue(cfg.dry_run)
 
     def test_one_way_ignores_stay_nights(self):
-        self.assertEqual(conf.load_config({"TRIP": "one-way", "STAY_NIGHTS": "not checked"}).stay_nights, [])
+        self.assertEqual(config.load_config({"TRIP": "one-way", "STAY_NIGHTS": "not checked"}).stay_nights, [])
 
     def test_every_problem_is_reported_together(self):
         with self.assertRaises(ValueError) as raised:
-            conf.load_config({
+            config.load_config({
                 "ROUTES": "SEL-TYO,icn_nrt,SEL-SEL", "DEPART_DATES": "2026-13-01", "DAYS_AHEAD": "-3,400",
                 "TRIP": "return", "SEAT": "cheap", "ADULTS": "0", "MAX_STOPS": "x", "CURRENCY": "wons",
                 "REQUEST_DELAY_MIN_SECONDS": "90", "REQUEST_DELAY_MAX_SECONDS": "20", "DRY_RUN": "yes",
                 "MAX_CONSECUTIVE_FAILURES": "0",
             })
-        message = str(raised.exception)
         for expected in (
-            "'icn_nrt'", "'SEL-SEL'", "'2026-13-01'", "'-3'", "'400'", "TRIP='return'", "SEAT='cheap'",
-            "ADULTS='0'", "MAX_STOPS='x'", "CURRENCY='WONS'", "REQUEST_DELAY_MAX_SECONDS", "DRY_RUN='yes'",
-            "MAX_CONSECUTIVE_FAILURES='0'",
+            "'icn_nrt'", "'SEL-SEL'", "'2026-13-01'", "'-3'", "'400'", "TRIP='return'", "SEAT='cheap'", "ADULTS='0'",
+            "MAX_STOPS='x'", "CURRENCY='WONS'", "REQUEST_DELAY_MAX_SECONDS", "DRY_RUN='yes'", "MAX_CONSECUTIVE_FAILURES='0'",
         ):
-            self.assertIn(expected, message)
+            self.assertIn(expected, str(raised.exception))
 
     def test_round_trip_needs_stay_nights(self):
         for bad in ("", "0", "31"):
             with self.subTest(STAY_NIGHTS=bad), self.assertRaises(ValueError):
-                conf.load_config({"STAY_NIGHTS": bad})
+                config.load_config({"STAY_NIGHTS": bad})
 
-    def test_routes_cant_be_empty(self):
-        with self.assertRaises(ValueError):
-            conf.load_config({"ROUTES": " , "})
+    def test_page_timeout(self):
+        self.assertEqual(main.page_timeout({}), 60)
+        self.assertEqual(main.page_timeout({"PAGE_TIMEOUT_SECONDS": "90"}), 90)
+        for bad in ("x", "5", "600"):
+            with self.subTest(PAGE_TIMEOUT_SECONDS=bad), self.assertRaises(ValueError):
+                main.page_timeout({"PAGE_TIMEOUT_SECONDS": bad})
 
 
 class DepartureDatesTest(unittest.TestCase):
     today = date(2026, 11, 19)
 
     def dates(self, depart_dates, days_ahead):
-        return conf.departure_dates(conf.load_config({"DEPART_DATES": depart_dates, "DAYS_AHEAD": days_ahead}), self.today)
+        return config.departure_dates(
+            config.load_config({"DEPART_DATES": depart_dates, "DAYS_AHEAD": days_ahead}), self.today)
 
     def test_nothing_set_is_today(self):
         self.assertEqual(self.dates("", ""), [self.today])
@@ -155,204 +172,161 @@ class DepartureDatesTest(unittest.TestCase):
     def test_passed_and_repeated_dates_are_dropped(self):
         self.assertEqual(self.dates("2026-11-01", ""), [])
         self.assertEqual(self.dates("2026-11-10", "5,9"), [self.today])
-        self.assertEqual(self.dates("2026-12-20,2026-12-21", "0,1"), [DEPART, date(2026, 12, 21), date(2026, 12, 22)])
 
 
-class LegCarriersTest(unittest.TestCase):
-    def test_reads_each_leg_in_result_order(self):
-        self.assertEqual(
-            g.leg_carriers(page([NONSTOP, CONNECTION])),
-            [[("YP", "731", "Air Premia")], [("KE", "1041", "Korean Air"), ("KE", "2125", "Korean Air")]],
-        )
+class PayloadsTest(unittest.TestCase):
+    def test_reads_every_results_payload(self):
+        self.assertEqual(parse.payloads(answer(payload(others=[NONSTOP]), payload(others=[CONNECTION]))),
+                         [payload(others=[NONSTOP]), payload(others=[CONNECTION])])
 
-    def test_a_malformed_carrier_is_none(self):
-        bad = [
-            ["YP", "73X1", None, "Air Premia"], ["yp", "731", None, "Air Premia"], ["YP", "731", None, " "],
-            ["YP", None, None, "Air Premia"], ["YP"], None, "YP731",
-        ]
-        for carrier in bad:
-            with self.subTest(carrier=carrier):
-                result = raw_result(["Air Premia"], [raw_leg("ICN", "NRT", carrier)], 1)
-                self.assertEqual(g.leg_carriers(page([result])), [[None]])
+    def test_an_error_answer_has_none(self):
+        self.assertEqual(parse.payloads(ERROR_ANSWER), [])
+        self.assertEqual(parse.payloads("not an answer"), [])
 
-    def test_a_page_not_as_expected_is_empty(self):
-        for html in ("<html>nothing</html>", '<script class="ds:1">no data here</script>', page([])):
-            with self.subTest(html=html[:40]):
-                self.assertEqual(g.leg_carriers(html), [])
+    def test_top_flights_first_then_the_others(self):
+        results = parse.raw_results(payload(top=[TOP], others=[NONSTOP, CONNECTION]))
+        self.assertEqual([top for top, _ in results], [True, False, False])
+        self.assertEqual(results[0][1], TOP)
+
+    def test_missing_lists_are_empty(self):
+        empty = [None] * 8
+        self.assertEqual(parse.raw_results(empty), [])
+        self.assertEqual(parse.raw_results([None, None, [None], [[NONSTOP]]]), [(False, NONSTOP)])
 
 
-class ChecksTest(unittest.TestCase):
-    def setUp(self):
-        self.nonstop = g.parse_results(page([NONSTOP]))[0]
+class FlightsTest(unittest.TestCase):
+    def test_flights_with_their_legs_and_google_rank(self):
+        flights, skipped = flights_of(payload(top=[TOP], others=[NONSTOP, CONNECTION]))
+        self.assertEqual(skipped, [])
+        self.assertEqual([(f.rank, f.top, f.price, f.itinerary_key) for f in flights], [
+            (0, True, 433489, "ZG46"), (1, False, 187400, "YP731"), (2, False, 242400, "KE1041+KE2125"),
+        ])
+        connection = flights[2]
+        self.assertEqual((connection.stops, connection.flying_min, connection.carbon_g, connection.typical_carbon_g),
+                         (1, 220, 80000, 90000))
+        self.assertEqual(connection.legs[1], parse.Leg(
+            "CJU", "NRT", datetime(2026, 12, 20, 9, 30), datetime(2026, 12, 20, 12, 0), 150, "Boeing 787",
+            "KE", "Korean Air", "KE2125",
+        ))
 
-    def test_carriers_match_fast_flights_airlines(self):
-        self.assertTrue(g.carriers_match(self.nonstop, [("YP", "731", "Air Premia")]))
-        self.assertFalse(g.carriers_match(self.nonstop, [("YP", "731", "Other Air")]))
-        self.assertFalse(g.carriers_match(self.nonstop, [None]))
-        self.assertFalse(g.carriers_match(self.nonstop, []))
+    def test_google_time_shorthand(self):
+        leg = raw_leg("ICN", "NRT", ["YP", "731", None, "Air Premia"], depart=[None, 31], arrive=[8])
+        (f,), _ = flights_of(payload(others=[raw_result(["Air Premia"], [leg], 1)]))
+        self.assertEqual((f.legs[0].depart_at.time().isoformat(), f.legs[0].arrive_at.time().isoformat()),
+                         ("00:31:00", "08:00:00"))
 
-    def test_a_connection_on_one_airline_matches_once(self):
-        connection = g.parse_results(page([CONNECTION]))[0]
-        self.assertTrue(g.carriers_match(connection, [("KE", "1041", "Korean Air"), ("KE", "2125", "Korean Air")]))
-
-    def test_a_good_result_has_no_problem(self):
-        self.assertIsNone(g.result_problem(self.nonstop, DEPART))
-
-    def test_problems(self):
-        cases = {
-            "price": raw_result(["Air Premia"], [raw_leg("ICN", "NRT", None)], -5),
-            "airport": raw_result(["Air Premia"], [raw_leg("icn", "NRT", None)], 1),
-            "duration": raw_result(["Air Premia"], [raw_leg("ICN", "NRT", None, duration=0)], 1),
-            "time": raw_result(["Air Premia"], [raw_leg("ICN", "NRT", None, depart=(25, 0))], 1),
-            "departs": raw_result(["Air Premia"], [raw_leg("ICN", "NRT", None, day=(2026, 12, 21))], 1),
-        }
-        for word, result in cases.items():
-            with self.subTest(problem=word):
-                self.assertIn(word, g.result_problem(g.parse_results(page([result]))[0], DEPART))
-
-    def test_a_missing_price_is_allowed(self):
-        result = raw_result(["Air Premia"], [raw_leg("ICN", "NRT", None)], 1)
-        result[1] = []
-        self.assertIsNone(g.result_problem(g.parse_results(page([result]))[0], DEPART))
-
-
-class ParseResultsTest(unittest.TestCase):
-    def test_results_without_a_price_dont_lose_the_page(self):
-        # every shape Google could leave a price out in: no price block, an empty one, a null one, no price pair
-        cases = [raw_result(["Air Premia"], [raw_leg("ICN", "NRT", None)], 1) for _ in range(4)]
+    def test_results_without_a_price_are_kept(self):
+        cases = [raw_result(["Air Premia"], [raw_leg("ICN", "NRT", ["YP", "731", None, "Air Premia"])], 1)
+                 for _ in range(4)]
         del cases[0][1]
         cases[1][1] = []
         cases[2][1] = None
         cases[3][1] = [[None]]
-        results = g.parse_results(page([NONSTOP, *cases, CONNECTION]))
-        self.assertEqual([f.price for f in results], [187400, None, None, None, None, 242400])
+        flights, skipped = flights_of(payload(others=cases))
+        self.assertEqual(([f.price for f in flights], skipped), ([None] * 4, []))
 
-    def test_the_same_results_as_fast_flights_on_a_normal_page(self):
-        html = page([NONSTOP, CONNECTION])
-        self.assertEqual(g.parse_results(html), g.parse_js(html.split('class="ds:1" nonce="x">', 1)[1]))
-
-    def test_no_flights_and_broken_pages(self):
-        with self.assertRaises(g.FlightsNotFound):
-            g.parse_results(NOT_FOUND_PAGE)
-        for html in ("<html>nothing</html>", '<script class="ds:1">no data here</script>'):
-            with self.subTest(html=html), self.assertRaises(Exception):
-                g.parse_results(html)
-
-    def test_a_result_without_a_price_is_saved_with_the_others(self):
-        priceless = raw_result(["ZIPAIR Tokyo"], [raw_leg("ICN", "NRT", ["ZG", "46", None, "ZIPAIR Tokyo"])], 1)
-        priceless[1] = []
-        (status, flights, error), _ = run_search(page([priceless, NONSTOP]))
-        self.assertEqual((status, error), ("ok", None))
-        self.assertEqual([(rank, f.price) for rank, f, _ in flights], [(0, None), (1, 187400)])
-
-
-class ItineraryKeyTest(unittest.TestCase):
-    def test_flight_numbers(self):
-        connection = g.parse_results(page([CONNECTION]))[0]
-        carriers = [("KE", "1041", "Korean Air"), ("KE", "2125", "Korean Air")]
-        self.assertEqual(g.itinerary_key(connection, carriers), "KE1041+KE2125")
-
-    def test_a_hash_when_a_number_is_missing_and_the_same_every_time(self):
-        nonstop = g.parse_results(page([NONSTOP]))[0]
-        key = g.itinerary_key(nonstop, [None])
-        self.assertRegex(key, r"^[0-9a-f]{16}$")
-        self.assertEqual(key, g.itinerary_key(g.parse_results(page([NONSTOP]))[0], [None]))
-
-
-class SearchTest(unittest.TestCase):
-    def test_flights_with_carriers_and_google_rank(self):
-        (status, flights, error), _ = run_search(page([NONSTOP, CONNECTION]))
-        self.assertEqual((status, error), ("ok", None))
-        self.assertEqual([(rank, legs) for rank, _, legs in flights], [
-            (0, [("YP", "731", "Air Premia")]),
-            (1, [("KE", "1041", "Korean Air"), ("KE", "2125", "Korean Air")]),
-        ])
-        self.assertEqual(flights[0][1].price, 187400)
-
-    def test_an_invalid_result_is_skipped_and_the_rest_keep_their_rank(self):
-        bad = raw_result(["Air Premia"], [raw_leg("ICN", "NRT", None, day=(2026, 12, 21))], 1)
-        with self.assertLogs(g.log, "WARNING"):
-            (status, flights, error), _ = run_search(page([bad, NONSTOP]))
-        self.assertEqual(status, "ok")
-        self.assertEqual([rank for rank, _, _ in flights], [1])
-        self.assertRegex(error, r"skipped 1 invalid results: #0 departs 2026-12-21")
-
-    def test_carriers_not_matching_the_airlines_are_left_out(self):
-        other = raw_result(["Air Premia"], [raw_leg("ICN", "NRT", ["ZG", "46", None, "ZIPAIR Tokyo"])], 200000)
-        with self.assertLogs(g.log, "WARNING"):
-            (status, flights, _), _ = run_search(page([other]))
-        self.assertEqual(flights[0][2], [None])
-
-    def test_carriers_that_dont_line_up_with_the_results_are_left_out(self):
-        html = page([NONSTOP])
-        with mock.patch.object(g, "leg_carriers", return_value=[]), self.assertLogs(g.log, "WARNING"):
-            (status, flights, _), _ = run_search(html)
-        self.assertEqual((status, flights[0][2]), ("ok", [None]))
-
-    def test_statuses(self):
+    def test_a_result_that_doesnt_check_out_is_skipped_with_the_reason(self):
         cases = {
-            "blocked": "<html>Our systems have detected unusual traffic from your computer</html>",
-            "error": "<html>something else entirely</html>",
-            "not_found": NOT_FOUND_PAGE,
+            "price -5": raw_result(["Air Premia"], [raw_leg("ICN", "NRT", None)], -5),
+            "airport 'icn'": raw_result(["Air Premia"], [raw_leg("icn", "NRT", None)], 1),
+            "duration 0": raw_result(["Air Premia"], [raw_leg("ICN", "NRT", None, duration=0)], 1),
+            "time": raw_result(["Air Premia"], [raw_leg("ICN", "NRT", None, depart=(25, 0))], 1),
+            "departs 2026-12-21": raw_result(["Air Premia"], [raw_leg("ICN", "NRT", None, day=(2026, 12, 21))], 1),
+            "no legs": raw_result(["Air Premia"], [], 1),
         }
-        for status, html in cases.items():
-            with self.subTest(status=status):
-                (got, flights, _), _ = run_search(html)
-                self.assertEqual((got, flights), (status, []))
+        for reason, result in cases.items():
+            with self.subTest(reason=reason):
+                flights, skipped = flights_of(payload(others=[NONSTOP, result]))
+                self.assertEqual([f.rank for f in flights], [0])
+                self.assertEqual(len(skipped), 1)
+                self.assertTrue(skipped[0].startswith(f"#1 {reason}"), skipped[0])
 
-    def test_a_normal_page_mentioning_captcha_is_not_blocked(self):
-        html = page([NONSTOP]).replace("</html>", '<a href="/recaptcha/challenge">x</a></html>')
-        (status, _, _), _ = run_search(html)
-        self.assertEqual(status, "ok")
+    def test_a_malformed_carrier_is_left_out(self):
+        for carrier in (["YP", "73X1", None, "Air Premia"], ["yp", "731", None, "Air Premia"],
+                        ["YP", "731", None, " "], ["YP"], None, "YP731"):
+            with self.subTest(carrier=carrier):
+                (f,), _ = flights_of(payload(others=[raw_result(["Air Premia"], [raw_leg("ICN", "NRT", carrier)], 1)]))
+                self.assertEqual((f.legs[0].airline_code, f.legs[0].airline, f.legs[0].flight_number), (None, None, None))
+                self.assertRegex(f.itinerary_key, r"^[0-9a-f]{16}$")
 
-    def test_a_fetch_failure_is_an_error(self):
-        with mock.patch.object(g, "fetch_flights_html", side_effect=TimeoutError("slow")):
-            status, flights, error = g.search(config(), "SEL", "TYO", DEPART, None)
-        self.assertEqual((status, flights), ("error", []))
-        self.assertIn("TimeoutError", error)
+    def test_carriers_not_matching_google_airlines_are_left_out(self):
+        other = raw_result(["Air Premia"], [raw_leg("ICN", "NRT", ["ZG", "46", None, "ZIPAIR Tokyo"])], 200000)
+        (f,), _ = flights_of(payload(others=[other]))
+        self.assertEqual(f.legs[0].flight_number, None)
 
-    def test_a_round_trip_query_has_the_return_and_one_ticket_only(self):
-        cfg = config(SEAT="business", ADULTS="2", MAX_STOPS="0")
-        _, query = run_search(page([NONSTOP]), cfg, return_date=RETURN)
-        self.assertEqual(query.get_trip_type(), "round-trip")
-        self.assertEqual(query.get_seat_type(), "business")
-        self.assertEqual(len(query.passengers), 2)
-        self.assertTrue(query.hide_separate_and_self_transfer)
-        outbound, back = query.flight_data
-        self.assertEqual((outbound.date, outbound.from_airport.airport, outbound.to_airport.airport),
-                         ("2026-12-20", "SEL", "TYO"))
-        self.assertEqual((back.date, back.from_airport.airport, back.to_airport.airport), ("2026-12-23", "TYO", "SEL"))
-        self.assertEqual(outbound.max_stops, 0)
-
-    def test_a_one_way_query_has_no_return(self):
-        _, query = run_search(page([NONSTOP]), config(TRIP="one-way"))
-        self.assertEqual(query.get_trip_type(), "one-way")
-        self.assertEqual(len(query.flight_data), 1)
-        self.assertTrue(query.hide_separate_and_self_transfer)
-
-
-class RowsTest(unittest.TestCase):
-    def test_flight_and_leg_rows(self):
-        (_, flights, _), _ = run_search(page([CONNECTION]))
-        rank, f, legs = flights[0]
-        self.assertEqual(db.flight_row("sid", rank, f, legs), (
-            "sid", 0, "GMP", "NRT", 242400, 1, datetime(2026, 12, 20, 7, 0), datetime(2026, 12, 20, 12, 0),
-            220, 80000, 90000, "KE1041+KE2125",
-        ))
-        self.assertEqual(db.leg_rows("sid", rank, f, legs), [
-            ("sid", 0, 0, "GMP", "CJU", datetime(2026, 12, 20, 7, 0), datetime(2026, 12, 20, 8, 10), 70,
-             "Airbus A321", "KE", "Korean Air", "KE1041"),
-            ("sid", 0, 1, "CJU", "NRT", datetime(2026, 12, 20, 9, 30), datetime(2026, 12, 20, 12, 0), 150,
-             "Boeing 787", "KE", "Korean Air", "KE2125"),
-        ])
+    def test_the_hash_key_is_the_same_every_time(self):
+        result = raw_result(["Air Premia"], [raw_leg("ICN", "NRT", None)], 1)
+        (a,), _ = flights_of(payload(others=[result]))
+        (b,), _ = flights_of(payload(others=[result]))
+        self.assertEqual(a.itinerary_key, b.itinerary_key)
 
     def test_unusable_optional_values_are_null(self):
-        result = raw_result(["Air Premia"], [raw_leg("ICN", "NRT", None, plane=" ")], 1, carbon=(-1, "x"))
-        with self.assertLogs(g.log, "WARNING"):
-            (_, flights, _), _ = run_search(page([result]))
-        rank, f, legs = flights[0]
-        self.assertEqual(db.flight_row("sid", rank, f, legs)[9:11], (None, None))
-        self.assertEqual(db.leg_rows("sid", rank, f, legs)[0][8:], (None, None, None, None))
+        result = raw_result(["Air Premia"], [raw_leg("ICN", "NRT", ["YP", "731", None, "Air Premia"], plane=" ")], 1,
+                            carbon=(-1, "x"))
+        (f,), _ = flights_of(payload(others=[result]))
+        self.assertEqual((f.carbon_g, f.typical_carbon_g, f.legs[0].plane_type), (None, None, None))
+
+
+class FakePage:
+    def __init__(self, content="<html></html>", url="https://www.google.com/travel/flights/search?tfs=x"):
+        self._content, self.url = content, url
+
+    def content(self):
+        return self._content
+
+    def title(self):
+        return "Seoul to Tokyo | Google Flights"
+
+
+class BrowserReadTest(unittest.TestCase):
+    def test_the_answer_with_the_most_results_is_the_page(self):
+        first = payload(others=[NONSTOP])
+        full = payload(top=[TOP], others=[NONSTOP, CONNECTION])
+        page = browser.Browser._read(FakePage(), [answer(first), answer(full)])
+        self.assertEqual((page.status, page.payload), ("ok", full))
+
+    def test_google_error_answer_is_an_error(self):
+        page = browser.Browser._read(FakePage("<html>Oops, something went wrong.</html>"), [ERROR_ANSWER])
+        self.assertEqual(page.status, "error")
+
+    def test_a_block_page(self):
+        for page in (FakePage(url="https://www.google.com/sorry/index?continue=x"),
+                     FakePage("<html>Our systems have detected unusual traffic</html>")):
+            with self.subTest(url=page.url):
+                self.assertEqual(browser.Browser._read(page, []).status, "blocked")
+
+    def test_no_answer_is_an_error_naming_the_page(self):
+        page = browser.Browser._read(FakePage(), [])
+        self.assertEqual(page.status, "error")
+        self.assertIn("Seoul to Tokyo", page.error)
+
+    def test_an_answer_without_results_or_error_is_not_found(self):
+        self.assertEqual(browser.Browser._read(FakePage(), [answer(payload())]).status, "not_found")
+
+
+class FakeBrowser:
+    """Browser for main(): each load gives the next of pages."""
+
+    def __init__(self, pages):
+        self.pages, self.urls = list(pages), []
+
+    def __call__(self, language, timeout):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def load(self, url):
+        self.urls.append(url)
+        return self.pages.pop(0)
+
+
+OK = browser.Page("ok", payload(others=[NONSTOP]), None)
+BLOCKED = browser.Page("blocked", None, None)
+ERROR = browser.Page("error", None, "x")
 
 
 class MainTest(unittest.TestCase):
@@ -361,55 +335,53 @@ class MainTest(unittest.TestCase):
         "START_JITTER_MAX_SECONDS": "0", "DRY_RUN": "true",
     }
 
-    def run_main(self, results, **env):
-        """main() with search() answering each call with the next of results, no sleeping and no database."""
-        calls = []
-
-        def fake_search(cfg, origin, destination, depart, return_date):
-            calls.append((origin, destination, depart, return_date))
-            return results[len(calls) - 1]
-
+    def run_main(self, pages, **env):
+        fake = FakeBrowser(pages)
         with mock.patch.dict(os.environ, {**self.ENV, **env}, clear=True), \
-                mock.patch.object(r, "search", side_effect=fake_search), \
-                mock.patch.object(r.time, "sleep"), \
-                mock.patch.object(r, "datetime", wraps=datetime) as fake_datetime, \
-                mock.patch.object(db, "connect") as connect, \
-                self.assertLogs(g.log, "INFO"):
+                mock.patch.object(main, "Browser", fake), \
+                mock.patch.object(main.time, "sleep"), \
+                mock.patch.object(main, "datetime", wraps=datetime) as fake_datetime, \
+                mock.patch.object(main.db, "connect") as connect, \
+                self.assertLogs("collector", "INFO"):
             fake_datetime.now.side_effect = lambda tz=None: datetime(2026, 11, 19, 9, 0, tzinfo=tz)
-            code = r.main()
-        return code, calls, connect
+            code = main.main()
+        return code, fake.urls, connect
 
     def test_a_search_per_route_date_and_stay_and_nothing_written_in_a_dry_run(self):
-        code, calls, connect = self.run_main([("ok", [], None)] * 4)
-        self.assertEqual(code, 0)
-        self.assertEqual(sorted(calls), [
-            ("SEL", "OSA", DEPART, RETURN), ("SEL", "OSA", DEPART, date(2026, 12, 24)),
-            ("SEL", "TYO", DEPART, RETURN), ("SEL", "TYO", DEPART, date(2026, 12, 24)),
-        ])
+        code, urls, connect = self.run_main([OK] * 4)
+        self.assertEqual((code, len(urls)), (0, 4))
+        expected = {
+            query.search_url(main.legs(o, d, DEPART, back), "round-trip", "economy", 1, None, "KRW", "en-US")
+            for o, d in (("SEL", "TYO"), ("SEL", "OSA")) for back in (RETURN, date(2026, 12, 24))
+        }
+        self.assertEqual(set(urls), expected)
         connect.assert_not_called()
 
     def test_one_way_has_no_return(self):
-        _, calls, _ = self.run_main([("ok", [], None)] * 2, TRIP="one-way")
-        self.assertEqual(sorted(calls), [("SEL", "OSA", DEPART, None), ("SEL", "TYO", DEPART, None)])
+        _, urls, _ = self.run_main([OK] * 2, TRIP="one-way")
+        self.assertEqual(set(urls), {
+            query.search_url([query.Leg(DEPART, "SEL", d)], "one-way", "economy", 1, None, "KRW", "en-US")
+            for d in ("TYO", "OSA")
+        })
 
     def test_stops_after_failures_in_a_row_and_fails_the_job(self):
-        code, calls, _ = self.run_main([("blocked", [], None)] * 4, MAX_CONSECUTIVE_FAILURES="2")
-        self.assertEqual((code, len(calls)), (1, 2))
+        code, urls, _ = self.run_main([BLOCKED] * 4, MAX_CONSECUTIVE_FAILURES="2")
+        self.assertEqual((code, len(urls)), (1, 2))
 
     def test_a_success_resets_the_failure_count(self):
-        results = [("blocked", [], None), ("ok", [], None), ("blocked", [], None), ("error", [], "x")]
-        code, calls, _ = self.run_main(results, MAX_CONSECUTIVE_FAILURES="2")
-        self.assertEqual((code, len(calls)), (0, 4))
+        code, urls, _ = self.run_main([BLOCKED, OK, BLOCKED, ERROR], MAX_CONSECUTIVE_FAILURES="2")
+        self.assertEqual((code, len(urls)), (0, 4))
 
     def test_a_bad_config_exits_2_before_searching(self):
-        with mock.patch.dict(os.environ, {"SEAT": "cheap"}, clear=True), \
-                mock.patch.object(r, "search") as search, self.assertLogs(g.log, "ERROR"):
-            self.assertEqual(r.main(), 2)
-        search.assert_not_called()
+        for env in ({"SEAT": "cheap"}, {"PAGE_TIMEOUT_SECONDS": "x"}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(main, "Browser") as browser_class, self.assertLogs("collector", "ERROR"):
+                self.assertEqual(main.main(), 2)
+                browser_class.assert_not_called()
 
     def test_all_dates_passed_is_nothing_to_do(self):
-        code, calls, _ = self.run_main([], DEPART_DATES="2026-11-01")
-        self.assertEqual((code, calls), (0, []))
+        code, urls, _ = self.run_main([], DEPART_DATES="2026-11-01")
+        self.assertEqual((code, urls), (0, []))
 
 
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"), "TEST_DATABASE_URL is not set")
@@ -428,27 +400,27 @@ class SaveTest(unittest.TestCase):
         self.conn.close()
 
     def test_a_round_trip_search_its_flights_and_legs(self):
-        (status, flights, error), _ = run_search(page([NONSTOP, CONNECTION]))
-        cfg = config(SEAT="economy")
+        flights, _ = flights_of(payload(top=[TOP], others=[NONSTOP, CONNECTION]))
         run_id = uuid.uuid4()
-        db.save(self.conn, cfg, run_id, datetime.now().astimezone(), "SEL", "TYO", DEPART, RETURN, status, flights, error)
-
-        search = self.conn.execute(
-            "SELECT run_id, trip, return_date, seat, adults, max_stops, currency, status, flight_count FROM search"
-        ).fetchall()
-        self.assertEqual(search, [(run_id, "round-trip", RETURN, "economy", 1, None, "KRW", "ok", 2)])
+        db.save(self.conn, config.load_config({}), run_id, datetime.now().astimezone(), "SEL", "TYO", DEPART, RETURN,
+                "ok", flights, None)
+        self.assertEqual(
+            self.conn.execute("SELECT run_id, trip, return_date, seat, adults, max_stops, currency, status, flight_count "
+                              "FROM search").fetchall(),
+            [(run_id, "round-trip", RETURN, "economy", 1, None, "KRW", "ok", 3)],
+        )
         self.assertEqual(
             self.conn.execute("SELECT rank, itinerary_key, price, stops FROM flight ORDER BY rank").fetchall(),
-            [(0, "YP731", 187400, 0), (1, "KE1041+KE2125", 242400, 1)],
+            [(0, "ZG46", 433489, 0), (1, "YP731", 187400, 0), (2, "KE1041+KE2125", 242400, 1)],
         )
         self.assertEqual(
             self.conn.execute("SELECT rank, seq, flight_number FROM leg ORDER BY rank, seq").fetchall(),
-            [(0, 0, "YP731"), (1, 0, "KE1041"), (1, 1, "KE2125")],
+            [(0, 0, "ZG46"), (1, 0, "YP731"), (2, 0, "KE1041"), (2, 1, "KE2125")],
         )
 
     def test_a_failed_search_is_kept_without_flights(self):
-        db.save(self.conn, config(TRIP="one-way"), uuid.uuid4(), datetime.now().astimezone(), "SEL", "TYO", DEPART,
-               None, "blocked", [], None)
+        db.save(self.conn, config.load_config({"TRIP": "one-way"}), uuid.uuid4(), datetime.now().astimezone(), "SEL",
+                "TYO", DEPART, None, "blocked", [], None)
         self.assertEqual(self.conn.execute("SELECT trip, status, flight_count FROM search").fetchall(),
                          [("one-way", "blocked", 0)])
         self.assertEqual(self.conn.execute("SELECT count(*) FROM flight").fetchone(), (0,))

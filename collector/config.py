@@ -30,7 +30,6 @@ class Config:
     # None is any number of stops
     max_stops: int | None
     currency: str
-    proxy: str | None
     start_jitter_max: float
     delay_min: float
     delay_max: float
@@ -53,7 +52,6 @@ def load_config(env=os.environ) -> Config:
     ADULTS                      1                 1 to 9, the price is for all of them
     MAX_STOPS                   (empty)           empty for any, 0 for nonstop only
     CURRENCY                    KRW               ISO 4217
-    PROXY                       (empty)           http://user:pass@host:port for Google's requests
     START_JITTER_MAX_SECONDS    1200              random wait before the first search, up to this
     REQUEST_DELAY_MIN_SECONDS   20                random pause between searches, from
     REQUEST_DELAY_MAX_SECONDS   90                to
@@ -148,7 +146,6 @@ def load_config(env=os.environ) -> Config:
         adults=adults,
         max_stops=max_stops,
         currency=currency,
-        proxy=get("PROXY", "") or None,
         start_jitter_max=number("START_JITTER_MAX_SECONDS", "1200"),
         delay_min=delay_min,
         delay_max=delay_max,
