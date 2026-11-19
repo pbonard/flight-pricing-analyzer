@@ -6,8 +6,11 @@ metadata:
   name: flight-collector
   namespace: backend
 data:
-  # origin-destination pairs, city codes cover all their airports (SEL is ICN and GMP, TYO is NRT and HND)
-  ROUTES: "SEL-TYO"
+    # nights of stay for the routes in ROUTES without their own
+  STAY_NIGHTS: "4"
+    # origin-destination pairs, city codes cover all their airports (SEL is ICN and GMP, TYO is NRT and HND).
+  # a pair may have its own nights of stay (:7), the others take STAY_NIGHTS
+  ROUTES: "SEL-TYO,BER-SEL:19"
   # the departure dates are BASE_DATE plus each of DAYS_AHEAD (0 is BASE_DATE itself, empty is 0).
   # BASE_DATE is one date (YYYY-MM-DD), or empty for the day of each run (KST). once a BASE_DATE has passed,
   # every run ends at once without searching: set a new one or suspend the cronjob
@@ -18,7 +21,6 @@ data:
   DAYS_AHEAD: "1,7,14,30,60"
   # round-trip or one-way, and for a round trip the nights between departure and return
   TRIP: "round-trip"
-  STAY_NIGHTS: "3"
   SEAT: "economy"
   ADULTS: "1"
   # empty for any number of stops, 0 for nonstop only

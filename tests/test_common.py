@@ -81,6 +81,26 @@ class LoadConfigTest(unittest.TestCase):
             with self.subTest(STAY_NIGHTS=bad), self.assertRaises(ValueError):
                 config.load_config({"STAY_NIGHTS": bad})
 
+    def test_a_route_can_have_its_own_stay(self):
+        cfg = config.load_config({"ROUTES": "SEL-TYO:3, sel-ber:7, SEL-OSA", "STAY_NIGHTS": "2"})
+        self.assertEqual(cfg.routes, [("SEL", "TYO"), ("SEL", "BER"), ("SEL", "OSA")])
+        self.assertEqual(cfg.route_stay_nights, {("SEL", "TYO"): 3, ("SEL", "BER"): 7})
+        self.assertEqual(cfg.stay_nights, [2])
+
+    def test_stay_nights_can_be_empty_when_every_route_has_its_own(self):
+        self.assertEqual(config.load_config({"ROUTES": "SEL-TYO:3,SEL-BER:7", "STAY_NIGHTS": ""}).stay_nights, [])
+        with self.assertRaises(ValueError) as raised:
+            config.load_config({"ROUTES": "SEL-TYO,SEL-BER:7", "STAY_NIGHTS": ""})
+        self.assertIn("SEL-TYO has no stay of its own", str(raised.exception))
+
+    def test_a_bad_route_stay_or_a_route_twice(self):
+        with self.assertRaises(ValueError) as raised:
+            config.load_config({"ROUTES": "SEL-BER:0,SEL-TYO:x,SEL-OSA:2|3,SEL-CJU:3,sel-cju:5"})
+        message = str(raised.exception)
+        for expected in ("'SEL-BER:0', its stay '0'", "'SEL-TYO:x', its stay 'x'", "'SEL-OSA:2|3', its stay '2|3'",
+                         "ROUTES has SEL-CJU twice"):
+            self.assertIn(expected, message)
+
     def test_routes_cant_be_empty(self):
         with self.assertRaises(ValueError):
             config.load_config({"ROUTES": " , "})
@@ -136,6 +156,20 @@ class RotationTest(unittest.TestCase):
             ("TYO", 7, 3), ("TYO", 7, 4), ("OSA", 7, 3), ("OSA", 7, 4),
             ("TYO", 1, 3), ("TYO", 1, 4), ("OSA", 1, 3), ("OSA", 1, 4),
         ])
+
+    def test_each_route_its_own_stay_the_others_stay_nights(self):
+        plan = config.plan(self.cfg(ROUTES="SEL-TYO:3,SEL-BER:7,SEL-OSA", DAYS_AHEAD="1", STAY_NIGHTS="2,4"), self.TODAY)
+        self.assertEqual([(d, (ret - dep).days) for _, d, dep, ret in plan],
+                         [("TYO", 3), ("BER", 7), ("OSA", 2), ("OSA", 4)])
+
+    def test_one_way_has_no_return_whatever_the_route_stay(self):
+        plan = config.plan(self.cfg(ROUTES="SEL-BER:7", DAYS_AHEAD="1", TRIP="one-way"), self.TODAY)
+        self.assertEqual(plan, [("SEL", "BER", date(2026, 11, 22), None)])
+
+    def test_the_rotation_goes_round_routes_with_their_own_stays(self):
+        runs = self.rotate(self.cfg(ROUTES="SEL-TYO:3,SEL-BER:7", DAYS_AHEAD="1,7"), 5)
+        self.assertEqual([(d, (dep - self.TODAY).days, (ret - dep).days) for _, d, dep, ret in runs],
+                         [("TYO", 1, 3), ("BER", 1, 7), ("TYO", 7, 3), ("BER", 7, 7), ("TYO", 1, 3)])
 
     def test_nothing_saved_yet_starts_at_the_first_search(self):
         self.assertEqual(config.next_search(self.cfg(ROUTES="SEL-TYO", DAYS_AHEAD="1,7"), self.TODAY, None),

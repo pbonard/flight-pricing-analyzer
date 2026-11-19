@@ -20,12 +20,14 @@ AIRPORT = re.compile(r"[A-Z]{3}")
 class Config:
     # (origin, destination) pairs, city or airport codes
     routes: list[tuple[str, str]]
+    # a route's own nights of stay, ROUTES' SEL-BER:7. routes without one take stay_nights
+    route_stay_nights: dict[tuple[str, str], int]
     # what DAYS_AHEAD counts from, None is the day of the run
     base_date: date | None
     # in the order given: the rotation takes them in this order
     days_ahead: list[int]
     trip: str
-    # nights between departure and return, a search for each. empty for one-way
+    # nights between departure and return, a search for each, for routes without their own. empty for one-way
     stay_nights: list[int]
     seat: str
     adults: int
@@ -41,14 +43,15 @@ class Config:
 def load_config(env=os.environ) -> Config:
     """Reads the environment. Every problem is collected and raised together, so one failed run shows them all.
 
-    ROUTES                      SEL-TYO,SEL-OSA   origin-destination pairs, city (SEL) or airport (ICN) codes
+    ROUTES                      SEL-TYO,SEL-OSA   origin-destination pairs, city (SEL) or airport (ICN) codes. a pair
+                                                  may have its own nights of stay: SEL-BER:7
     BASE_DATE                   (empty)           one date, YYYY-MM-DD, that DAYS_AHEAD counts from. empty is the
                                                   day of the run (KST). once it has passed the run ends at once
     DAYS_AHEAD                  7,14,30,60        days after BASE_DATE to search, 0 is BASE_DATE itself. empty is 0.
                                                   each run does the next one (see next_search), in this order
     TRIP                        round-trip        round-trip or one-way
-    STAY_NIGHTS                 3                 round trip: nights between departure and return, 2,3,4 searches
-                                                  each. ignored for one-way
+    STAY_NIGHTS                 3                 round trip: nights between departure and return for the routes
+                                                  without their own, 2,3,4 searches each. ignored for one-way
     SEAT                        economy           economy, premium-economy, business or first
     ADULTS                      1                 1 to 9, the price is for all of them
     MAX_STOPS                   (empty)           empty for any, 0 for nonstop only
@@ -76,14 +79,24 @@ def load_config(env=os.environ) -> Config:
             problems.append(f"{name}={raw!r} is below {low}" if high is None else f"{name}={raw!r} is out of {low}..{high}")
         return value
 
-    routes = []
+    routes, route_stay_nights = [], {}
     for route in items("ROUTES", "SEL-TYO,SEL-OSA"):
-        parts = route.upper().split("-")
-        if len(parts) == 2 and all(AIRPORT.fullmatch(p) for p in parts) and parts[0] != parts[1]:
-            routes.append((parts[0], parts[1]))
-        else:
+        pair, _, stay = route.partition(":")
+        parts = pair.strip().upper().split("-")
+        if not (len(parts) == 2 and all(AIRPORT.fullmatch(p) for p in parts) and parts[0] != parts[1]):
             problems.append(f"ROUTES has {route!r}, not ORIGIN-DESTINATION of two different 3 letter codes")
-    if not routes:
+            continue
+        key = (parts[0], parts[1])
+        if key in routes:
+            problems.append(f"ROUTES has {pair.strip().upper()} twice")
+            continue
+        routes.append(key)
+        if stay.strip():
+            if stay.strip().isdigit() and 1 <= int(stay) <= 30:
+                route_stay_nights[key] = int(stay)
+            else:
+                problems.append(f"ROUTES has {route!r}, its stay {stay.strip()!r} is not a number of nights from 1 to 30")
+    if not routes and not problems:
         problems.append("ROUTES is empty")
 
     base_raw = get("BASE_DATE", "")
@@ -112,8 +125,10 @@ def load_config(env=os.environ) -> Config:
                 stay_nights.append(int(n))
             else:
                 problems.append(f"STAY_NIGHTS has {n!r}, not a number of nights from 1 to 30")
-        if not stay_nights:
-            problems.append("STAY_NIGHTS is empty, a round trip needs a return")
+        without_own = [f"{o}-{d}" for o, d in routes if (o, d) not in route_stay_nights]
+        if not stay_nights and without_own:
+            problems.append(f"STAY_NIGHTS is empty, and {', '.join(without_own)} has no stay of its own: "
+                            "a round trip needs a return")
 
     seat = get("SEAT", "economy").lower()
     if seat not in SEATS:
@@ -134,6 +149,7 @@ def load_config(env=os.environ) -> Config:
 
     config = Config(
         routes=routes,
+        route_stay_nights=route_stay_nights,
         base_date=base_date,
         days_ahead=days_ahead,
         trip=trip,
@@ -171,15 +187,24 @@ Search = tuple[str, str, date, date | None]
 
 def plan(config: Config, today: date) -> list[Search]:
     """Every search, as (origin, destination, departure, return or None), in the rotation's order: DAYS_AHEAD as
-    given, each of its dates for every route in ROUTES' order, every stay. Nothing once BASE_DATE has passed."""
-    stays = [timedelta(days=n) for n in config.stay_nights] or [None]
+    given, each of its dates for every route in ROUTES' order, every stay of the route. Nothing once BASE_DATE has
+    passed."""
     return [
         (origin, destination, depart, depart + stay if stay else None)
         for offset in (config.days_ahead or [0])
         for depart in departure_dates(config, today, [offset])
         for origin, destination in config.routes
-        for stay in stays
+        for stay in stays(config, (origin, destination))
     ]
+
+
+def stays(config: Config, route: tuple[str, str]) -> list[timedelta | None]:
+    """A route's stays: its own from ROUTES, otherwise STAY_NIGHTS. [None] for one-way, it has no return."""
+    if config.trip != "round-trip":
+        return [None]
+    if route in config.route_stay_nights:
+        return [timedelta(days=config.route_stay_nights[route])]
+    return [timedelta(days=n) for n in config.stay_nights]
 
 
 def _position(config: Config, today: date, search: Search) -> tuple:
