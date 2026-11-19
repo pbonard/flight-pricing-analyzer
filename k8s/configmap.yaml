@@ -1,0 +1,40 @@
+# what the collector searches, read when each run starts: a change here, synced by argo cd, applies from the next run.
+# the collector checks every value first, a bad one fails that run with the reason in its log (kubectl logs job/...).
+# try a change without writing anything with DRY_RUN: "true" and a manual run:
+#   kubectl -n backend create job --from=cronjob/flight-collector flight-collector-try
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flight-collector
+  namespace: backend
+data:
+  # origin-destination pairs. city codes cover all their airports: SEL is ICN and GMP, TYO is NRT and HND,
+  # OSA is KIX and ITM. an airport code (ICN-NRT) searches only that airport. each route is a search per date
+  ROUTES: "SEL-TYO,SEL-OSA"
+  # what to search is each base date plus each of DAYS_AHEAD (0 is the base itself, empty is 0).
+  # the base dates are DEPART_DATES (YYYY-MM-DD,...), or the day of each run (KST) when it's empty:
+  #   ""            + "1,7"  -> tomorrow and a week from today, moving with each run
+  #   "2026-12-20"  + ""     -> 2026-12-20 until it passes
+  #   "2026-12-20"  + "1"    -> 2026-12-21 only
+  DEPART_DATES: ""
+  DAYS_AHEAD: "1,7"
+  # round-trip or one-way. a round trip saves its outbound flights, each priced as the whole round-trip ticket
+  # (with the cheapest return of the return date on the same ticket)
+  TRIP: "round-trip"
+  # round trip: nights between departure and return. a list (2,3,4) is a search for each, multiplying the searches
+  STAY_NIGHTS: "3"
+  # economy, premium-economy, business or first
+  SEAT: "economy"
+  # the price is for all of them
+  ADULTS: "1"
+  # empty for any number of stops, 0 for nonstop only
+  MAX_STOPS: ""
+  CURRENCY: "KRW"
+  # a random wait before the first search, and random pauses between searches, so runs don't look scheduled
+  START_JITTER_MAX_SECONDS: "1200"
+  REQUEST_DELAY_MIN_SECONDS: "20"
+  REQUEST_DELAY_MAX_SECONDS: "90"
+  # blocked or failed searches in a row before the run stops, more requests only make a block last longer
+  MAX_CONSECUTIVE_FAILURES: "3"
+  # "true" searches and logs but writes nothing
+  DRY_RUN: "false"
