@@ -4,3 +4,5 @@
 k8s
 *.md
 .DS_Store
+analysis
+tests

@@ -5,7 +5,13 @@ on:
       - main
     paths-ignore:
       - k8s/**
-      - analysis.sql
+      - analysis/**
+      - '*.md'
+  # a pull request runs the tests only, its build and deploy wait for the merge
+  pull_request:
+    paths-ignore:
+      - k8s/**
+      - analysis/**
       - '*.md'
 
 permissions:
@@ -13,7 +19,43 @@ permissions:
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    # the save tests write to a real postgres, the version of the cloudnative-pg cluster
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: checkout github
+        uses: actions/checkout@v6
+
+      - name: set up python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: install
+        run: pip install -r requirements.txt
+
+      - name: test
+        env:
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: python -m unittest discover -s tests -t . -v
+
   build:
+    needs: test
+    # only main is built and deployed
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - name: checkout github
