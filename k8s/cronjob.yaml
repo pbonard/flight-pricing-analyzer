@@ -1,7 +1,7 @@
-# every 4 hours KST the collector opens the searches of the flight-collector configmap (k8s/configmap.yaml) in
-# headless chromium and writes the whole result list to the cloudnative-pg cluster of my-infra
-# k8s/bootstrap/postgres-cluster.yaml.
-# every 4 hours, not 2: a browser search is heavier on Google, and searching too often gets the ip throttled.
+# every 4 hours KST the collector does the next search of the flight-collector configmap's rotation (k8s/configmap.yaml),
+# the one after the search the run before saved, writes it to the cloudnative-pg cluster of my-infra
+# k8s/bootstrap/postgres-cluster.yaml and ends. the schedule alone is how often: "0 */6 * * *" is every 6 hours.
+# once the configmap's BASE_DATE has passed every run ends at once, suspend it then.
 # the jitter is in the collector, the schedule stays on the hour so it's easy to read
 apiVersion: batch/v1
 kind: CronJob
@@ -34,8 +34,11 @@ spec:
             - name: ghcr
           containers:
             - name: collector
-              # the tag is written by .github/workflows/build.yml on every push to main
-              image: ghcr.io/pbonard/flight-pricing-analyzer:f6af878
+              # which collector runs, two images of every build (.github/workflows/build.yml):
+              #   ghcr.io/pbonard/fast-flight-collector  fast-flights, a plain request per search
+              #   ghcr.io/pbonard/playwright-collector   a browser, the whole result list
+              # change the name to switch, the tag is written by the build on every push to main
+              image: ghcr.io/pbonard/fast-flight-collector:latest
               # what to search, k8s/configmap.yaml
               envFrom:
                 - configMapRef:
@@ -48,10 +51,11 @@ spec:
                       name: postgres-app
                       key: uri
               resources:
-                # chromium takes a few hundred MB while a page is open
+                # fast-flights needs about 100Mi, playwright's chromium a few hundred while a page is open:
+                # the limit fits either, so switching the image needs nothing else
                 requests:
-                  cpu: 200m
-                  memory: 512Mi
+                  cpu: 50m
+                  memory: 128Mi
                 limits:
                   memory: 1Gi
               securityContext:
@@ -59,10 +63,9 @@ spec:
                 readOnlyRootFilesystem: true
                 runAsNonRoot: true
               volumeMounts:
-                # chromium's profile, cache and shared memory (--disable-dev-shm-usage) are in /tmp
+                # the root filesystem is read only, temporary files go here
                 - name: tmp
                   mountPath: /tmp
           volumes:
             - name: tmp
-              emptyDir:
-                sizeLimit: 1Gi
+              emptyDir: {}

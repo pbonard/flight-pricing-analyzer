@@ -1,0 +1,9 @@
+.venv
+.git
+.github
+k8s
+*.md
+.DS_Store
+analysis
+tests
+__pycache__

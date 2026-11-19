@@ -1,14 +1,18 @@
-"""Saving to Postgres: the tables of schema.sql, next to this file, applied at the start of every run (it only adds
-what isn't there).
+"""Saving to Postgres, the same for both collectors: a search with its Flights and their Legs (model.py).
+
+The database is DATABASE_URL, in k8s the CloudNativePG cluster's postgres-app secret. The tables are schema.sql,
+next to this file, applied at the start of every run: it only adds what isn't there.
 """
 
 import os
+from datetime import date
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import psycopg
 
-from .config import Config
-from .parse import Flight
+from .config import Config, Search
+from .model import Flight
 
 SCHEMA = Path(__file__).resolve().parent / "schema.sql"
 
@@ -20,6 +24,17 @@ def connect() -> psycopg.Connection:
 
 def ensure_schema(conn) -> None:
     conn.execute(SCHEMA.read_text())
+
+
+def last_search(conn) -> tuple[Search, date] | None:
+    """The search saved last, failed ones too, and the day (KST) it was saved: where the rotation goes on from."""
+    row = conn.execute(
+        "SELECT origin, destination, depart_date, return_date, fetched_at FROM search ORDER BY fetched_at DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return None
+    origin, destination, depart, return_date, fetched_at = row
+    return (origin, destination, depart, return_date), fetched_at.astimezone(ZoneInfo("Asia/Seoul")).date()
 
 
 def flight_row(search_id, f: Flight) -> tuple:

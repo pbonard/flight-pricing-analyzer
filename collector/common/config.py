@@ -1,4 +1,4 @@
-"""What the collector searches: the environment, checked into a Config.
+"""What a collector searches: the environment, checked into a Config. Shared by both collectors.
 
 In k8s the environment comes from the ConfigMap in k8s/configmap.yaml, read when each run starts. Every value is
 checked before anything is searched, a bad one fails the run with the reason.
@@ -20,7 +20,9 @@ AIRPORT = re.compile(r"[A-Z]{3}")
 class Config:
     # (origin, destination) pairs, city or airport codes
     routes: list[tuple[str, str]]
-    depart_dates: list[date]
+    # what DAYS_AHEAD counts from, None is the day of the run
+    base_date: date | None
+    # in the order given: the rotation takes them in this order
     days_ahead: list[int]
     trip: str
     # nights between departure and return, a search for each. empty for one-way
@@ -30,10 +32,8 @@ class Config:
     # None is any number of stops
     max_stops: int | None
     currency: str
+    proxy: str | None
     start_jitter_max: float
-    delay_min: float
-    delay_max: float
-    max_consecutive_failures: int
     # search and log, but write nothing: to try a config without touching the data
     dry_run: bool
 
@@ -42,9 +42,10 @@ def load_config(env=os.environ) -> Config:
     """Reads the environment. Every problem is collected and raised together, so one failed run shows them all.
 
     ROUTES                      SEL-TYO,SEL-OSA   origin-destination pairs, city (SEL) or airport (ICN) codes
-    DEPART_DATES                (empty)           base dates, YYYY-MM-DD. empty is the day of the run (KST)
-    DAYS_AHEAD                  7,14,30,60        days after each base date to search, 0 is the base date itself.
-                                                  empty is 0. dates that have passed are left out
+    BASE_DATE                   (empty)           one date, YYYY-MM-DD, that DAYS_AHEAD counts from. empty is the
+                                                  day of the run (KST). once it has passed the run ends at once
+    DAYS_AHEAD                  7,14,30,60        days after BASE_DATE to search, 0 is BASE_DATE itself. empty is 0.
+                                                  each run does the next one (see next_search), in this order
     TRIP                        round-trip        round-trip or one-way
     STAY_NIGHTS                 3                 round trip: nights between departure and return, 2,3,4 searches
                                                   each. ignored for one-way
@@ -52,10 +53,8 @@ def load_config(env=os.environ) -> Config:
     ADULTS                      1                 1 to 9, the price is for all of them
     MAX_STOPS                   (empty)           empty for any, 0 for nonstop only
     CURRENCY                    KRW               ISO 4217
-    START_JITTER_MAX_SECONDS    1200              random wait before the first search, up to this
-    REQUEST_DELAY_MIN_SECONDS   20                random pause between searches, from
-    REQUEST_DELAY_MAX_SECONDS   90                to
-    MAX_CONSECUTIVE_FAILURES    3                 blocked or failed searches in a row before the run stops
+    PROXY                       (empty)           http://user:pass@host:port for Google's requests
+    START_JITTER_MAX_SECONDS    1200              random wait before the search, up to this
     DRY_RUN                     false             true searches and logs, writes nothing
     """
     problems: list[str] = []
@@ -74,7 +73,7 @@ def load_config(env=os.environ) -> Config:
             problems.append(f"{name}={raw!r} is not a {'whole number' if kind is int else 'number'}")
             return kind(default)
         if value < low or (high is not None and value > high):
-            problems.append(f"{name}={raw!r} is out of {low}..{high if high is not None else ''}")
+            problems.append(f"{name}={raw!r} is below {low}" if high is None else f"{name}={raw!r} is out of {low}..{high}")
         return value
 
     routes = []
@@ -87,12 +86,13 @@ def load_config(env=os.environ) -> Config:
     if not routes:
         problems.append("ROUTES is empty")
 
-    depart_dates = []
-    for d in items("DEPART_DATES", ""):
+    base_raw = get("BASE_DATE", "")
+    base_date = None
+    if base_raw:
         try:
-            depart_dates.append(date.fromisoformat(d))
+            base_date = date.fromisoformat(base_raw)
         except ValueError:
-            problems.append(f"DEPART_DATES has {d!r}, not a YYYY-MM-DD date")
+            problems.append(f"BASE_DATE={base_raw!r} is not one YYYY-MM-DD date")
 
     days_ahead = []
     for n in items("DAYS_AHEAD", "7,14,30,60"):
@@ -127,10 +127,6 @@ def load_config(env=os.environ) -> Config:
     if not re.fullmatch(r"[A-Z]{3}", currency):
         problems.append(f"CURRENCY={currency!r} is not a 3 letter ISO 4217 code")
 
-    delay_min = number("REQUEST_DELAY_MIN_SECONDS", "20")
-    delay_max = number("REQUEST_DELAY_MAX_SECONDS", "90")
-    if delay_max < delay_min:
-        problems.append(f"REQUEST_DELAY_MAX_SECONDS={delay_max} is below REQUEST_DELAY_MIN_SECONDS={delay_min}")
 
     dry_run_raw = get("DRY_RUN", "false").lower()
     if dry_run_raw not in ("true", "false"):
@@ -138,7 +134,7 @@ def load_config(env=os.environ) -> Config:
 
     config = Config(
         routes=routes,
-        depart_dates=depart_dates,
+        base_date=base_date,
         days_ahead=days_ahead,
         trip=trip,
         stay_nights=sorted(set(stay_nights)),
@@ -146,10 +142,8 @@ def load_config(env=os.environ) -> Config:
         adults=adults,
         max_stops=max_stops,
         currency=currency,
+        proxy=get("PROXY", "") or None,
         start_jitter_max=number("START_JITTER_MAX_SECONDS", "1200"),
-        delay_min=delay_min,
-        delay_max=delay_max,
-        max_consecutive_failures=number("MAX_CONSECUTIVE_FAILURES", "3", int, 1),
         dry_run=dry_run_raw == "true",
     )
     if problems:
@@ -157,11 +151,56 @@ def load_config(env=os.environ) -> Config:
     return config
 
 
-def departure_dates(config: Config, today: date) -> list[date]:
-    """Each base date plus each of DAYS_AHEAD. The bases are DEPART_DATES, or today when it's empty: fixed bases
-    follow the same trips up to the day, today as the base shows how far out is cheapest."""
-    bases = config.depart_dates or [today]
-    offsets = config.days_ahead or [0]
-    dates = {base + timedelta(days=n) for base in bases for n in offsets}
-    # a fixed date that has passed has nothing left to sell
-    return sorted(d for d in dates if d >= today)
+def stale(config: Config, today: date) -> bool:
+    """BASE_DATE has passed: nothing is left to search from it, a run ends at once."""
+    return config.base_date is not None and config.base_date < today
+
+
+def departure_dates(config: Config, today: date, offsets: list[int] | None = None) -> list[date]:
+    """BASE_DATE (today when it's empty) plus each offset, by default all of DAYS_AHEAD. Nothing once BASE_DATE has
+    passed. A fixed BASE_DATE follows the same trips up to the day, today as the base shows how far out is cheapest."""
+    if stale(config, today):
+        return []
+    base = config.base_date or today
+    offsets = offsets if offsets is not None else (config.days_ahead or [0])
+    return sorted({base + timedelta(days=n) for n in offsets})
+
+
+Search = tuple[str, str, date, date | None]
+
+
+def plan(config: Config, today: date) -> list[Search]:
+    """Every search, as (origin, destination, departure, return or None), in the rotation's order: DAYS_AHEAD as
+    given, each of its dates for every route in ROUTES' order, every stay. Nothing once BASE_DATE has passed."""
+    stays = [timedelta(days=n) for n in config.stay_nights] or [None]
+    return [
+        (origin, destination, depart, depart + stay if stay else None)
+        for offset in (config.days_ahead or [0])
+        for depart in departure_dates(config, today, [offset])
+        for origin, destination in config.routes
+        for stay in stays
+    ]
+
+
+def _position(config: Config, today: date, search: Search) -> tuple:
+    """Where a search is in the rotation, the same from one day to the next: its route, how many days after the
+    base date it leaves, and its stay. The date itself moves with the day when the base is the day of the run."""
+    origin, destination, depart, return_date = search
+    base = config.base_date or today
+    return origin, destination, (depart - base).days, (return_date - depart).days if return_date else None
+
+
+def next_search(config: Config, today: date, last: Search | None, last_day: date | None = None) -> Search | None:
+    """The search of this run: the one after the last saved one (last, saved on last_day) in the rotation, the
+    first one when nothing was saved yet or the last one isn't in the plan any more (the config changed). None when
+    there's nothing to search. So how often a search comes is the cronjob's schedule alone."""
+    planned = plan(config, today)
+    if not planned:
+        return None
+    if last is None:
+        return planned[0]
+    positions = [_position(config, today, s) for s in planned]
+    previous = _position(config, last_day or today, last)
+    if previous not in positions:
+        return planned[0]
+    return planned[(positions.index(previous) + 1) % len(planned)]

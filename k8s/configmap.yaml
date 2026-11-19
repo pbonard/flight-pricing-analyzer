@@ -7,13 +7,15 @@ metadata:
   namespace: backend
 data:
   # origin-destination pairs, city codes cover all their airports (SEL is ICN and GMP, TYO is NRT and HND)
-  ROUTES: "SEL-TYO,SEL-OSA"
-  # what to search is each base date plus each of DAYS_AHEAD (0 is the base itself, empty is 0).
-  # the base dates are DEPART_DATES (YYYY-MM-DD,...), or the day of each run (KST) when it's empty.
-  # fixed dates are followed every run until they leave, for how one flight's price moves up to departure:
-  # a friday and a tuesday each week, weekend against weekday. add the next week's as these pass
-  DEPART_DATES: "2026-11-27,2026-12-01,2026-12-04,2026-12-08,2026-12-11,2026-12-15"
-  DAYS_AHEAD: ""
+  ROUTES: "SEL-TYO"
+  # the departure dates are BASE_DATE plus each of DAYS_AHEAD (0 is BASE_DATE itself, empty is 0).
+  # BASE_DATE is one date (YYYY-MM-DD), or empty for the day of each run (KST). once a BASE_DATE has passed,
+  # every run ends at once without searching: set a new one or suspend the cronjob
+  BASE_DATE: ""
+  # each run does one search, the one after the search the run before saved, then over again:
+  # +1 -> +7 -> +14 -> +30 -> +60 -> +1 ... with more routes, each date's routes take turns: TYO+1 -> OSA+1 -> TYO+7.
+  # how often is the cronjob's schedule alone (k8s/cronjob.yaml)
+  DAYS_AHEAD: "1,7,14,30,60"
   # round-trip or one-way, and for a round trip the nights between departure and return
   TRIP: "round-trip"
   STAY_NIGHTS: "3"
@@ -22,14 +24,7 @@ data:
   # empty for any number of stops, 0 for nonstop only
   MAX_STOPS: ""
   CURRENCY: "KRW"
-  # a browser search is heavy on Google, so it waits long:
-  # up to 30 minutes before the first search, and 1 to 3 minutes between searches
+  # a random wait before the search, so it doesn't come at the same minute every time
   START_JITTER_MAX_SECONDS: "1800"
-  REQUEST_DELAY_MIN_SECONDS: "60"
-  REQUEST_DELAY_MAX_SECONDS: "180"
-  # failed or blocked searches in a row before the run stops, more requests only make a block last longer
-  MAX_CONSECUTIVE_FAILURES: "3"
-  # how long one search's page may take, its first results and the click on "View more flights" together
-  PAGE_TIMEOUT_SECONDS: "60"
   # "true" searches and logs but writes nothing
   DRY_RUN: "false"
